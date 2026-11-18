@@ -1,0 +1,21 @@
+# 构建产物
+build/
+dist/
+*.spec.bak
+
+# 本机调试 / 测试现场
+_shot*.png
+_p*.png
+_shot*_cfg.json
+_shot_dark_cfg.json
+tests_cfg_*.json
+tests_*.py
+_*
+*_v12_backup.py.txt
+
+# 运行现场（exe 同目录生成）
+*.log
+config.json
+
+# 旧版界面截图
+界面_*.png
