@@ -394,10 +394,9 @@ class Engine:
         if sess_dev is not None and bool(cfg.get("use_windows_volume", True)):
             try:
                 win_vol = sess_dev.EndpointVolume
-                # 回环采集看到的是「音量前」的信号。把虚拟设备拉回 100%，
-                # 这样滑块从 100% 往下拖才有意义（否则起点只有 9%，一拖就没声）。
-                if not getattr(self, "_win_vol_init", False):
-                    win_vol.SetMasterVolumeLevelScalar(1.0, None)
+                # 绝不修改用户的 Windows 音量滑块——只读它当输出增益。
+                # 曲线用「滑块值 / 正常位置」计算，用户把滑块停在哪都行。
+                if getattr(self, "_win_vol_init", False) is False:
                     self._win_vol_init = True
             except Exception:
                 win_vol = None

@@ -45,17 +45,40 @@ def spawn_ui():
 
 
 def make_icon_image():
+    """托盘、窗口、exe 共用同一张 icon.ico，保证三处图标完全一致。"""
+    ico = os.path.join(app_dir(), "icon.ico")
+    if not os.path.exists(ico):
+        ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    # 托盘 / 窗口 / exe 三者都从同一个 icon.ico 取，保证完全一致。
+    # 注意：多尺寸 ICO 必须设 .size 再 .load().copy()；直接 convert 可能拿到空帧。
     try:
         from PIL import Image, ImageDraw
+        img = None
+        with Image.open(ico) as f:
+            for sz in (64, 32, 256, 48):
+                try:
+                    f.size = (sz, sz)
+                    f.load()
+                    cand = f.convert("RGBA")
+                    if cand.getchannel("A").getbbox():
+                        img = cand
+                        break
+                except Exception:
+                    continue
+        if img is not None:
+            return img
+        # 兜底：ICO 取帧全失败时重画同款图案，绝不让托盘变空白
+        s = 256
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((5, 5, s-6, s-6), radius=56, fill=(37, 99, 235, 255))
+        for x0, top, bot in ((21, 50, 82), (43, 28, 82), (65, 40, 82)):
+            d.rounded_rectangle((int(x0*s/100), int(top*s/100),
+                                 int((x0+13)*s/100), int(bot*s/100)),
+                                radius=int(3*s/100), fill=(255, 255, 255, 255))
+        return img
     except Exception:
         return None
-    size = 128
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, size - 5, size - 5), fill=(37, 99, 235, 255))
-    for x0, y0, x1, y1 in ((30, 62, 52, 96), (54, 44, 76, 96), (78, 54, 100, 96)):
-        d.rounded_rectangle((x0, y0, x1, y1), radius=6, fill=(255, 255, 255, 235))
-    return img
 
 
 def build_tray(config, stop):

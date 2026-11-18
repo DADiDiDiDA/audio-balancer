@@ -407,7 +407,7 @@ class AppWindow:
                 "声音会一直待在目标附近。" % float(cfg.get("max_boost_db", 12))
                 if auto else
                 "仅限制：只把超过目标的部分压下来，安静的内容原样通过（不会放大底噪）。")
-        p.text(x + 22, by + 98, desc, 9, pal["sub"], width=w - 44)
+        p.text(x + 22, by + 94, desc, 9, pal["sub"], width=w - 44, anchor="nw")
 
         col = (w - 44 - 26) / 2.0
         p.field(x + 22, by + 150, col, "目标响度", float(cfg.get("target_lufs", -18)),
@@ -580,20 +580,22 @@ class AppWindow:
         p.text(x + 24, cy + 60, "响度均衡", 10, pal["accent"], bold=True)
         p.text(x + 24, cy + 80,
                "从 CABLE 虚拟声卡采集正在播放的声音，按 ITU-R BS.1770 测节目响度，"
-               "自动电平把它拉进目标范围，再经软限幅送到耳机。", 9, pal["sub"], width=w - 48)
-        p.text(x + 24, cy + 130, "自动静音", 10, pal["accent"], bold=True)
-        p.text(x + 24, cy + 150,
+               "自动电平把它拉进目标范围，再经软限幅送到耳机。", 9, pal["sub"],
+               width=w - 48, anchor="nw")
+        p.text(x + 24, cy + 134, "自动静音", 10, pal["accent"], bold=True)
+        p.text(x + 24, cy + 154,
                "名单里的程序挂机（在后台）时静音它自己；可选地在它前台时让其它程序让路。",
-               9, pal["sub"], width=w - 48)
-        p.divider(x + 24, cy + 200, w - 48)
-        p.text(x + 24, cy + 220,
-               "不改系统音量，也不改各程序音量（自动静音例外：退出或关闭开关时按原值恢复）。",
-               9, pal["dim"], width=w - 48)
+               9, pal["sub"], width=w - 48, anchor="nw")
+        p.divider(x + 24, cy + 202, w - 48)
+        p.text(x + 24, cy + 216,
+               "只读系统音量滑块、绝不修改它；也不改各程序音量（自动静音例外：退出时按原值恢复）。",
+               9, pal["dim"], width=w - 48, anchor="nw")
 
         p.card(x, cy + 270, w, 100)
         p.text(x + 24, cy + 294, "配置文件", 9, pal["dim"])
-        p.text(x + 24, cy + 316, (self.config.path or ""), 9, pal["sub"], width=w - 48)
-        p.text(x + 24, cy + 344,
+        p.text(x + 24, cy + 314, (self.config.path or ""), 9, pal["sub"],
+               width=w - 48, anchor="nw")
+        p.text(x + 24, cy + 350,
                "端到端延迟默认约 %d ms，可在「音频设备」里用缓冲滑块调节"
                % int(float(self.config.get("block_ms", 33)) * 2
                      + max(30, float(self.config.get("block_ms", 33)) + 18)),
