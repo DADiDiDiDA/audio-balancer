@@ -31,8 +31,11 @@ DEFAULTS = {
     "limiter_ceiling_db": -1.0,
     "lufs_window_ms": 1000,
     # 采集/播放块长（毫秒）。越小延迟越低，越小也越容易被别的线程抢占导致咔哒声。
-    # 端到端延迟 ≈ 块长 × 2 + WASAPI 缓冲（块长 + 18ms）。
-    "block_ms": 33,
+    # 端到端延迟 ≈ 块长 + 队列余量(≤1块) + WASAPI 缓冲(块长+10)。
+    "block_ms": 20,
+    # 用 Windows 音量滑块（CABLE Input 那个）控制最终音量。
+    # 启动时会把 CABLE 的音量设为 100%，之后滑块直接作为输出增益。
+    "use_windows_volume": True,
     "silence_gate_lufs": -60.0,
     "dc_blocker_hz": 10.0,
     "gain_attack_ms": 120.0,

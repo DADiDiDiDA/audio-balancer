@@ -18,7 +18,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.3"
+VERSION = "1.4"
 
 SIDE_W = 192
 
@@ -335,8 +335,9 @@ class AppWindow:
             cv.create_text(38, y + 20, text=label, anchor="w",
                            font=(FONT, 11, "bold" if active else "normal"),
                            fill=pal["text"] if active else pal["sub"])
+            # 事件分发会传 (x, y)，回调必须能吞掉这两个参数
             self._side_hits.append({"box": (14, y, 178, y + 40),
-                                    "press": (lambda k=key: self._goto(k))})
+                                    "press": (lambda _x, _y, k=key: self._goto(k))})
             y += 46
 
         st = self.engine.status
@@ -521,9 +522,9 @@ class AppWindow:
         p.cv.create_window(x + 132, cy + 108, window=cb2, anchor="nw",
                            width=w - 176, height=30)
 
-        blk = float(cfg.get("block_ms", 33))
+        blk = float(cfg.get("block_ms", 20))
         p.field(x + 22, cy + 152, w - 44, "缓冲（越小延迟越低，越小越容易咔哒）",
-                blk, 20, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v)
+                blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v)
         p.text(x + 22, cy + 200,
                "当前端到端延迟约 %.0f ms（块长 ×2 + 设备缓冲）" % (blk * 2 + max(30, blk + 18)),
                8, pal["dim"])
@@ -539,7 +540,16 @@ class AppWindow:
                9, pal["sub"], width=w - 60)
         self.m_default = p.text(x + 22, ty + 112, "系统默认输出：—", 9, pal["dim"])
 
-        by = ty + 150
+        vc = ty + 148
+        p.card(x, vc, w, 70)
+        p.text(x + 22, vc + 24, "用 Windows 音量滑块控制声音大小", 11, bold=True)
+        p.text(x + 22, vc + 48,
+               "系统音量里「CABLE In 16ch」的滑块就是最终音量（启动时置 100%）。"
+               "回环不受它影响，引擎会主动读它当输出增益。", 9, pal["sub"])
+        p.toggle(x + w - 24 - 46, vc + 20,
+                 lambda: bool(cfg.get("use_windows_volume", True)), self._on_winvol)
+
+        by = vc + 84
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
         p.text(x + 22, by + 52,
@@ -633,7 +643,9 @@ class AppWindow:
                     cv.coords(self.m_mark, self._mmap(lufs) - 2, self.meter[2] - 10)
                 except Exception:
                     pass
-            foot = ("响度 %s LUFS · 增益 %s" % (_fmt_lufs(lufs), _fmt_db(gain)))
+            foot = ("响度 %s LUFS · 增益 %s · Win音量 %.0f%%" % (
+                _fmt_lufs(lufs), _fmt_db(gain),
+                float(st.get("win_vol", 1.0) or 1.0) * 100))
             self._set_foot(foot, pal["sub"])
         elif err:
             self._set_foot(str(err), pal["err"])
@@ -757,6 +769,10 @@ class AppWindow:
 
     def _on_follow(self, v):
         self._set("auto_follow_default", bool(v))
+
+    def _on_winvol(self, v):
+        self._set("use_windows_volume", bool(v))
+        self.root.after(10, lambda: self.engine.request_reload())
 
     def _on_block(self, v):
         """缓冲改动要重建会话才生效；拖动时别每格都重连，停手 0.6 秒再应用。"""

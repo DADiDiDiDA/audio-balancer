@@ -19,3 +19,7 @@ config.json
 
 # 旧版界面截图
 界面_*.png
+
+# 架构拆分后的状态文件与旧入口备份
+.audiobalancer_status.json
+*_old.py.txt

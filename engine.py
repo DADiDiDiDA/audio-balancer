@@ -181,7 +181,7 @@ class Engine:
             "running": False, "error": None,
             "lufs": -70.0, "gain_db": 0.0, "pre_db": 0.0,
             "input": "-", "output": "-", "out_mode": "-",
-            "underrun": 0, "buffered": 0, "waiting": False,
+            "underrun": 0, "buffered": 0, "waiting": False, "win_vol": 1.0,
         }
 
     # ---------- 设备 ----------
@@ -349,7 +349,8 @@ class Engine:
         meter = SlidingLUFS(SR, window_ms=self._num(cfg, "lufs_window_ms", 1000, 200, 5000))
         dc = DcBlocker(SR, fc=self._num(cfg, "dc_blocker_hz", 10, 1, 120), channels=CHANNELS)
 
-        state = {"gain": 0.0, "lufs": -70.0, "underrun": 0, "warm": 0.0}
+        state = {"gain": 0.0, "lufs": -70.0, "underrun": 0, "warm": 0.0,
+                 "win_vol": 1.0}
         self._thread_error = None      # 工作线程的现场：不许再悄悄吞掉
         # 门控要按「监听输入这个端点」查会话；找不到就 None（函数里兑底为 True）
         try:
@@ -357,11 +358,25 @@ class Engine:
                         if (d.FriendlyName or "") == in_dev.name][0]
         except Exception:
             sess_dev = None
-        block_ms = self._num(cfg, "block_ms", 33, 20, 120)
+        block_ms = self._num(cfg, "block_ms", 20, 10, 100)
         blk = int(round(SR * block_ms / 1000.0))
-        deadband_ms = max(30, int(block_ms) + 18)      # WASAPI 缓冲 ≈ 一块 + 抖动余量
+        deadband_ms = max(24, int(block_ms) + 10)   # WASAPI 缓冲 ≈ 一块 + 小余量
         self.status["block_ms"] = int(block_ms)
-        q = queue.Queue(maxsize=4)
+        q = queue.Queue(maxsize=3)                # 留一块余量吸收抖动，额外延迟 ≤ 一块
+
+        # Windows 音量滑块（CABLE Input 的端点音量）对回环采集不起作用，
+        # 必须在引擎里主动读出来当输出增益用，用户才能用系统音量控大小。
+        win_vol = None
+        if sess_dev is not None and bool(cfg.get("use_windows_volume", True)):
+            try:
+                win_vol = sess_dev.EndpointVolume
+                # 回环采集看到的是「音量前」的信号。把虚拟设备拉回 100%，
+                # 这样滑块从 100% 往下拖才有意义（否则起点只有 9%，一拖就没声）。
+                if not getattr(self, "_win_vol_init", False):
+                    win_vol.SetMasterVolumeLevelScalar(1.0, None)
+                    self._win_vol_init = True
+            except Exception:
+                win_vol = None
         self._q = q
         self._publish(running=True, error=None,
                       input=in_dev.name, output=out_dev.name)
@@ -513,6 +528,20 @@ class Engine:
 
                             y = x * pre * float(10.0 ** (state["gain"] / 20.0))
                             y = soft_limit(y, self._num(cfg, "limiter_ceiling_db", -1.0, -6, 0))
+
+                        # Windows 音量滑块：放在限幅之后，纯粹当最终输出音量，
+                        # 不会把目标响度 / 增益判定带偏
+                        if win_vol is not None:
+                            try:
+                                if win_vol.GetMute():
+                                    vol_scalar = 0.0
+                                else:
+                                    vol_scalar = float(win_vol.GetMasterVolumeLevelScalar())
+                            except Exception:
+                                vol_scalar = 1.0
+                            y = y * vol_scalar
+                            state["win_vol"] = vol_scalar
+
                         if self.tap is not None:
                             try:
                                 self.tap(x, y)
@@ -525,6 +554,7 @@ class Engine:
                             last = now
                             self._publish(lufs=state["lufs"], gain_db=state["gain"],
                                           pre_db=state.get("pre_db", 0.0),
+                                          win_vol=state.get("win_vol", 1.0),
                                           underrun=state["underrun"], buffered=q.qsize())
             except Exception:
                 self._thread_error = traceback.format_exc()

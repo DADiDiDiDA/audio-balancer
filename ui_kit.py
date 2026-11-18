@@ -345,7 +345,9 @@ class Painter:
         self.text(x, y, label, 10, self.pal["dim"] if disabled else self.pal["sub"])
         if note:
             self.text(x + w, y, note, 9, self.pal["dim"], anchor="e")
-        sl = self.slider(x, y + 22, w - 58, lo, hi, step, value, on_change,
+        # 数值文字最宽约 80px（如 "-17.5 LUFS" / "-1.0 dBFS"），
+        # 轨道必须提前收手，否则滑块推到最右时旋钮会压在数字上
+        sl = self.slider(x, y + 22, max(40, w - 92), lo, hi, step, value, on_change,
                          disabled=disabled, fmt=fmt)
         val = self.text(x + w, y + 22, fmt(value), 10,
                         self.pal["dim"] if disabled else self.pal["text"], anchor="e")
