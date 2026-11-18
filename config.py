@@ -36,6 +36,10 @@ DEFAULTS = {
     # 用 Windows 音量滑块（CABLE Input 那个）控制最终音量。
     # 启动时会把 CABLE 的音量设为 100%，之后滑块直接作为输出增益。
     "use_windows_volume": True,
+    # 音量曲线：滑块 20% = 正常音量(1.0)，100% = 正常音量 + winvol_max_db。
+    # 线性映射下 20% 只有 0.2 倍（几乎无声），改成对数刻度后低段更好用。
+    "winvol_ref": 0.20,
+    "winvol_max_db": 10.0,
     "silence_gate_lufs": -60.0,
     "dc_blocker_hz": 10.0,
     "gain_attack_ms": 120.0,
@@ -68,7 +72,7 @@ DEFAULTS = {
     ],
     # 界面
     "start_minimized": False,
-    "window_size": "940x760",
+    "window_size": "940x790",
 }
 
 

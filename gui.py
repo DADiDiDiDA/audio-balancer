@@ -67,7 +67,7 @@ class AppWindow:
 
         root.title(APP_TITLE)
         root.geometry(config.get("window_size", "940x760"))
-        root.minsize(880, 660)
+        root.minsize(900, 760)
         root.configure(bg=self.pal["bg"])
         theme.apply_acrylic(root, self.dark, alpha=1.0)
         self._style_ttk()
@@ -541,15 +541,28 @@ class AppWindow:
         self.m_default = p.text(x + 22, ty + 118, "系统默认输出：—", 9, pal["dim"])
 
         vc = ty + 156
-        p.card(x, vc, w, 84)
+        p.card(x, vc, w, 204)
         p.text(x + 22, vc + 26, "用 Windows 音量滑块控制声音大小", 11, bold=True)
-        p.text(x + 22, vc + 60,
-               "系统音量里「CABLE In 16ch」的滑块就是最终音量（启动时置 100%）。"
-               "回环不受它影响，引擎会主动读它当输出增益。", 9, pal["sub"], width=w - 60)
-        p.toggle(x + w - 24 - 46, vc + 22,
+        p.text(x + 22, vc + 50,
+               "系统音量里「CABLE In 16ch」的滑块即为最终音量，引擎主动读它当输出增益。",
+               9, pal["sub"], width=w - 60)
+        p.toggle(x + w - 24 - 46, vc + 20,
                  lambda: bool(cfg.get("use_windows_volume", True)), self._on_winvol)
 
-        by = vc + 96
+        col = (w - 44 - 26) / 2.0
+        p.field(x + 22, vc + 78, col, "正常音量位置",
+                float(cfg.get("winvol_ref", 0.20)) * 100, 5, 60, 1,
+                self._on_winvol_ref, fmt=lambda v: "%.0f%%" % v,
+                note="此处=标准音量")
+        p.field(x + 22 + col + 26, vc + 78, col, "最大增益",
+                float(cfg.get("winvol_max_db", 10.0)), 0, 20, 0.5,
+                self._on_winvol_max, fmt=lambda v: "+%.1f dB" % v,
+                note="100% 时")
+        p.text(x + 22, vc + 162,
+               "默认：滑块 20% 是正常音量，往上到 100% 逐渐增大（最多 +10 dB）。"
+               "觉得整体偏大/偏小，调上面两项即可。", 9, pal["dim"], width=w - 44)
+
+        by = vc + 216
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
         p.text(x + 22, by + 52,
@@ -791,6 +804,12 @@ class AppWindow:
     def _on_winvol(self, v):
         self._set("use_windows_volume", bool(v))
         self.root.after(10, lambda: self.engine.request_reload())
+
+    def _on_winvol_ref(self, v):
+        self._set("winvol_ref", float(v) / 100.0)
+
+    def _on_winvol_max(self, v):
+        self._set("winvol_max_db", float(v))
 
     def _on_block(self, v):
         """缓冲改动要重建会话才生效；拖动时别每格都重连，停手 0.6 秒再应用。"""

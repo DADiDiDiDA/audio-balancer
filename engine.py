@@ -106,20 +106,44 @@ def soft_limit(x, ceiling_db):
     return np.where(a > knee, np.sign(x) * limited, x)
 
 
+def volume_curve(v, ref=0.20, max_db=10.0):
+    """Windows 音量滑块 0..1 → 输出增益。
+
+    线性映射（直接 y *= v）在低段变化太陡、高段又到顶就没声了：
+    20% 只有 0.2 倍（-14dB），几乎听不见。改用对数刻度：
+        v = 0      → 0（静音）
+        v = ref    → 1.0（正常音量，默认 20%）
+        v = 1.0    → 10^(max_db/20)（默认 +10dB ≈ 3.16 倍）
+    这样 20% 是舒服的正常音量，往上到 100% 还能一路增大。
+    """
+    v = float(min(max(v, 0.0), 1.0))
+    if v <= 0.0:
+        return 0.0
+    if v >= 1.0:
+        return float(10.0 ** (max_db / 20.0))
+    ref = float(min(max(ref, 0.02), 0.8))
+    if v <= ref:
+        # 0..ref：从静音平滑爬到 1.0（平方曲线，低段更细腻）
+        return (v / ref) ** 2
+    # ref..1：1.0 起按 dB 线性升到 max_db
+    frac = (v - ref) / (1.0 - ref)
+    return float(10.0 ** (frac * max_db / 20.0))
+
+
 def desired_gain(mode, target, rng, lufs, max_att, max_boost):
     """输入响度 → 需要的增益（dB）。
 
     auto（自动电平）：目标是**区间** target ± rng。
-        落在区间里 → 0（完全不动）；
-        偏低 → 提上来，但只提到区间下沿（不会一路追到目标值），上限 max_boost；
-        偏高 → 压下去，同样只压到区间上沿。
+        落在区间里 → 往区间中部拉，但只拉一半（温和不抽吸）；
+        偏低 → 提到中部（target），偏高 → 压到中部；上限 max_boost。
     limit（仅限制）：只把超过 target 的部分压下来，永不放大。
     """
     if mode == "auto":
         err = target - lufs
         if abs(err) <= rng:
-            return 0.0
-        return float(np.clip(err - float(np.sign(err)) * rng, -max_att, max_boost))
+            # 区间内也往中部走，但力度减半：小声片段会被托起来，又不至于一直在动
+            return float(np.clip(err * 0.5, -max_att, max_boost))
+        return float(np.clip(err, -max_att, max_boost))
     return float(np.clip(target - lufs, -max_att, 0.0))
 
 
@@ -495,10 +519,30 @@ class Engine:
                         pre = float(10.0 ** (pre_db / 20.0)) if pre_db else 1.0
                         state["pre_db"] = pre_db
 
+                        # Windows 音量滑块：先读出增益倍数，放进限幅之前一起处理，
+                        # 这样 100%（+10dB）时被限幅器兜住，不会硬削波。
+                        # 测量仍是增益前的 x，所以调音量不影响响度判定。
+                        if win_vol is not None:
+                            try:
+                                if win_vol.GetMute():
+                                    vol_gain = 0.0
+                                    vol_scalar = 0.0
+                                else:
+                                    vol_scalar = float(win_vol.GetMasterVolumeLevelScalar())
+                                    vol_gain = volume_curve(
+                                        vol_scalar,
+                                        self._num(cfg, "winvol_ref", 0.20, 0.02, 0.8),
+                                        self._num(cfg, "winvol_max_db", 10.0, 0, 20))
+                            except Exception:
+                                vol_scalar, vol_gain = 1.0, 1.0
+                        else:
+                            vol_scalar, vol_gain = 1.0, 1.0
+                        state["win_vol"] = vol_scalar
+
                         if bool(cfg.get("passthrough", False)):
                             # 直通：完全不处理，原样搬运（排查 / 只要自动静音时用）
                             state["gain"] = 0.0
-                            y = x * pre
+                            y = x * pre * vol_gain
                         else:
                             gate = self._num(cfg, "silence_gate_lufs", -60, -90, -20)
                             enabled = bool(cfg.get("enabled", True))
@@ -526,21 +570,8 @@ class Engine:
                             coeff = 1.0 - float(np.exp(-dt / max(tau, 1e-3)))
                             state["gain"] += (desired - state["gain"]) * coeff
 
-                            y = x * pre * float(10.0 ** (state["gain"] / 20.0))
+                            y = x * pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain
                             y = soft_limit(y, self._num(cfg, "limiter_ceiling_db", -1.0, -6, 0))
-
-                        # Windows 音量滑块：放在限幅之后，纯粹当最终输出音量，
-                        # 不会把目标响度 / 增益判定带偏
-                        if win_vol is not None:
-                            try:
-                                if win_vol.GetMute():
-                                    vol_scalar = 0.0
-                                else:
-                                    vol_scalar = float(win_vol.GetMasterVolumeLevelScalar())
-                            except Exception:
-                                vol_scalar = 1.0
-                            y = y * vol_scalar
-                            state["win_vol"] = vol_scalar
 
                         if self.tap is not None:
                             try:
