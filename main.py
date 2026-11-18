@@ -112,7 +112,9 @@ def build_tray(config, stop):
         Menu.SEPARATOR,
         MenuItem("退出", quit_app),
     )
-    return pystray.Icon("AudioBalancer", make_icon_image(), "音频均衡器", menu)
+    # 换 ID 强制 Windows 重新注册托盘图标：旧 ID 曾被缓存成 pystray 默认羽毛图标
+    # （早期版本图标取到空帧时 pystray 用了默认图，Windows 按 ID 缓存了下来）。
+    return pystray.Icon("AudioBalancer_v2", make_icon_image(), "音频均衡器", menu)
 
 
 def watch_show_event(stop):

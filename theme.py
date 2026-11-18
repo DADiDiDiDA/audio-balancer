@@ -120,6 +120,24 @@ def apply_acrylic(root, dark, alpha=0.94):
         # 深色标题栏（Win10 1809+ / Win11 都是 20）
         v = ctypes.c_int(1 if dark else 0)
         dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 20, ctypes.byref(v), 4)
+        # 标题栏背景色匹配内容区：浅色模式下光靠 attribute 20 会给系统灰，
+        # 和内容区的浅蓝白不搭；用 DWMWA_CAPTION_COLOR(35) 显式指定颜色。
+        if build >= 22000:
+            try:
+                pal = palette(dark)
+                hexc = pal["bg"].lstrip("#")
+                r, g, b = int(hexc[0:2], 16), int(hexc[2:4], 16), int(hexc[4:6], 16)
+                color = ctypes.c_uint((b << 16) | (g << 8) | r)   # DWM 用 COLORREF (BGR)
+                dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 35,
+                                          ctypes.byref(color), 4)
+                # 标题栏文字：深色主题用浅字，浅色主题用深字（DWMWA_TEXT_COLOR=36）
+                t = pal["text"].lstrip("#")
+                tr, tg, tb = int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
+                tcol = ctypes.c_uint((tb << 16) | (tg << 8) | tr)
+                dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 36,
+                                          ctypes.byref(tcol), 4)
+            except Exception:
+                pass
         if build >= 22000:
             bd = ctypes.c_int(3)      # 3 = DWMSBT_TRANSIENTWINDOW（亚克力）
             dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 38, ctypes.byref(bd), 4)

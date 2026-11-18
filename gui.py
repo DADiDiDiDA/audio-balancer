@@ -465,20 +465,20 @@ class AppWindow:
                  lambda: bool(cfg.get("mute_others_in_game", False)), self._on_mute_others)
 
         vy = ry + 158
-        p.card(x, vy, w, 142)
+        p.card(x, vy, w, 160)
         p.section(x + 22, vy + 24, "音量")
         col = (w - 44 - 26) / 2.0
-        p.field(x + 22, vy + 50, col, "名单程序在前台时",
+        p.field(x + 22, vy + 52, col, "名单程序在前台时",
                 float(cfg.get("mute_fg_volume", 1.0)), 0, 1, 0.05,
                 self._on_fg, fmt=lambda v: "%.0f%%" % (v * 100))
-        p.field(x + 22 + col + 26, vy + 50, col, "压到",
+        p.field(x + 22 + col + 26, vy + 52, col, "压到",
                 float(cfg.get("mute_bg_volume", 0.0)), 0, 1, 0.05,
                 self._on_bg, fmt=lambda v: "%.0f%%" % (v * 100))
-        p.field(x + 22, vy + 106, col, "渐变时长",
+        p.field(x + 22, vy + 110, col, "渐变时长",
                 float(cfg.get("mute_easing_ms", 300)), 100, 2000, 50,
                 self._on_easing, fmt=lambda v: "%.0f ms" % v)
 
-        gy = vy + 154
+        gy = vy + 174
         head, row_h, line_px = 52, 44, 23     # 23px = YaHei 10pt 的实测行高
         list_h = int(H - gy - 8 - head - row_h)
         list_h = max(line_px * 3, (list_h // line_px) * line_px)   # 整行数，避免半行被切
@@ -503,33 +503,33 @@ class AppWindow:
         p.text(x, y + 34, "声音从 CABLE 虚拟声卡进来，处理后送到耳机", 10, pal["sub"])
 
         cy = y + 62
-        p.card(x, cy, w, 214)
+        p.card(x, cy, w, 232)
         p.section(x + 22, cy + 24, "设备", "改完立即重连（约 0.2 秒静音）", right=x + w - 22)
 
-        p.text(x + 22, cy + 70, "监听输入", 10, pal["sub"])
+        p.text(x + 22, cy + 68, "监听输入", 10, pal["sub"])
         cb1 = ttk.Combobox(p.cv, textvariable=self.var_input,
                            values=[""] + self._inputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
         cb1.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
-        p.cv.create_window(x + 132, cy + 62, window=cb1, anchor="nw",
+        p.cv.create_window(x + 132, cy + 60, window=cb1, anchor="nw",
                            width=w - 176, height=30)
 
-        p.text(x + 22, cy + 116, "输出设备", 10, pal["sub"])
+        p.text(x + 22, cy + 122, "输出设备", 10, pal["sub"])
         cb2 = ttk.Combobox(p.cv, textvariable=self.var_output,
                            values=[""] + self._outputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
         cb2.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
-        p.cv.create_window(x + 132, cy + 108, window=cb2, anchor="nw",
+        p.cv.create_window(x + 132, cy + 114, window=cb2, anchor="nw",
                            width=w - 176, height=30)
 
         blk = float(cfg.get("block_ms", 20))
-        p.field(x + 22, cy + 152, w - 44, "缓冲（越小延迟越低，越小越容易咔哒）",
+        p.field(x + 22, cy + 164, w - 44, "缓冲（越小延迟越低，越小越容易咔哒）",
                 blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v)
-        p.text(x + 22, cy + 200,
+        p.text(x + 22, cy + 212,
                "当前端到端延迟约 %.0f ms（块长 ×2 + 设备缓冲）" % (blk * 2 + max(30, blk + 18)),
                8, pal["dim"])
 
-        ty = cy + 226
+        ty = cy + 244
         p.card(x, ty, w, 144)
         p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
         p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
