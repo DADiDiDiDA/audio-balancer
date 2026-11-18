@@ -319,8 +319,9 @@ class AppWindow:
             cv.configure(bg=pal["sidebar"])
 
         ui_kit.shape(cv, 24, 24, 38, 38, 19, fill=pal["accent"])
+        # 三根柱子垂直居中于圆心(43)：top = 43 - bh/2，不再让柱底都压在圆心
         for bx, bh in ((32, 12), (39, 20), (46, 14)):
-            ui_kit.shape(cv, bx, 43 - bh, 4, bh, 2, fill=pal["on_accent"])
+            ui_kit.shape(cv, bx, 43 - bh / 2.0, 4, bh, 2, fill=pal["on_accent"])
         cv.create_text(74, 34, text=APP_TITLE, font=(FONT, 12, "bold"),
                        fill=pal["text"], anchor="w")
         cv.create_text(74, 53, text="v" + VERSION, font=(FONT, 9),
@@ -565,9 +566,10 @@ class AppWindow:
         by = vc + 216
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
-        p.text(x + 22, by + 52,
-               "提示：系统默认输出设成「CABLE In 16ch / CABLE Input」，本程序从它采集声音。",
-               9, pal["dim"], width=w - 44)
+        # 提示放按钮同一行右侧，不额外占高度，避免和底部状态栏重叠
+        p.text(x + 256, by + 6,
+               "系统默认输出设为 CABLE 虚拟声卡，本程序从它采集声音。",
+               9, pal["dim"], anchor="nw", width=w - 280)
 
     def _page_about(self, p, x, y, w, H):
         pal = self.pal

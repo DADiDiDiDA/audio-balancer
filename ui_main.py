@@ -132,12 +132,22 @@ def run_ui():
     cmds = queue.Queue()
 
     root = tk.Tk()
-    ico = os.path.join(app_dir(), "icon.ico")
-    if os.path.exists(ico):
-        try:
-            root.iconbitmap(default=ico)
-        except Exception:
-            pass
+    # 打包后 icon.ico 在 PyInstaller 的 _MEIPASS 临时目录，不在 exe 旁边
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(getattr(sys, "_MEIPASS", ""))
+    bases.append(app_dir())
+    bases.append(os.path.dirname(os.path.abspath(__file__)))
+    for base in bases:
+        if not base:
+            continue
+        ico = os.path.join(base, "icon.ico")
+        if os.path.exists(ico):
+            try:
+                root.iconbitmap(default=ico)
+                break
+            except Exception:
+                pass
     app = AppWindow(root, config, engine, muter, cmds, guard=guard)
     # UI 是按需进程：关掉窗口就真的退出 UI，核心进程继续在托盘里跑；
     # 点托盘「打开主界面」再拉起一个新的 UI 进程。
