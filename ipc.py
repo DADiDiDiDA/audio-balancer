@@ -47,15 +47,24 @@ def set_event(name):
 
 
 def write_status(data):
+    tmp = None
     try:
         folder = os.path.dirname(STATUS_PATH) or "."
         fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, STATUS_PATH)
+        tmp = None
         return True
     except Exception:
         return False
+    finally:
+        # os.replace 偶发失败（目标文件正被读）会留下 .tmp，跑久了堆一地
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
 
 def read_status():

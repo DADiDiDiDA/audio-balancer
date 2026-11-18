@@ -530,26 +530,26 @@ class AppWindow:
                8, pal["dim"])
 
         ty = cy + 226
-        p.card(x, ty, w, 136)
+        p.card(x, ty, w, 144)
         p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
         p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
                  self._on_follow)
-        p.text(x + 22, ty + 56,
+        p.text(x + 22, ty + 64,
                "在 Windows 里把默认输出换成耳机，本程序自动把它接成输出设备，"
                "再把系统默认改回虚拟声卡 —— 下次换耳机只要在 Windows 里点一下。",
                9, pal["sub"], width=w - 60)
-        self.m_default = p.text(x + 22, ty + 112, "系统默认输出：—", 9, pal["dim"])
+        self.m_default = p.text(x + 22, ty + 118, "系统默认输出：—", 9, pal["dim"])
 
-        vc = ty + 148
-        p.card(x, vc, w, 70)
-        p.text(x + 22, vc + 24, "用 Windows 音量滑块控制声音大小", 11, bold=True)
-        p.text(x + 22, vc + 48,
+        vc = ty + 156
+        p.card(x, vc, w, 84)
+        p.text(x + 22, vc + 26, "用 Windows 音量滑块控制声音大小", 11, bold=True)
+        p.text(x + 22, vc + 60,
                "系统音量里「CABLE In 16ch」的滑块就是最终音量（启动时置 100%）。"
-               "回环不受它影响，引擎会主动读它当输出增益。", 9, pal["sub"])
-        p.toggle(x + w - 24 - 46, vc + 20,
+               "回环不受它影响，引擎会主动读它当输出增益。", 9, pal["sub"], width=w - 60)
+        p.toggle(x + w - 24 - 46, vc + 22,
                  lambda: bool(cfg.get("use_windows_volume", True)), self._on_winvol)
 
-        by = vc + 84
+        by = vc + 96
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
         p.text(x + 22, by + 52,
@@ -698,9 +698,27 @@ class AppWindow:
                 self.apply_theme()
         except Exception:
             pass
+        self._follow_devices()
         self._follow_config()
         self._update_live()
         self.root.after(220, self._poll)
+
+    def _follow_devices(self):
+        """核心进程异步提供设备列表；UI 启动时状态文件可能还没写好。
+
+        下拉框是按 self._inputs / _outputs 建的，列表变化时必须重画当前页，
+        否则「音频设备」页永远是空的两个下拉框（必现 bug）。
+        """
+        try:
+            ins = list(self.engine.status.get("inputs") or [])
+            outs = list(self.engine.status.get("outputs") or [])
+        except Exception:
+            return
+        if ins == self._inputs and outs == self._outputs:
+            return
+        self._inputs, self._outputs = ins, outs
+        if self.page == "device":
+            self.render()
 
     def _follow_config(self):
         """托盘 / 设备守护改了配置时，界面跟着变（不反向写配置）。"""

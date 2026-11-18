@@ -110,18 +110,26 @@ class Config:
     def save(self):
         with self._lock:
             data = copy.deepcopy(self._data)
+        tmp = None
         try:
             folder = os.path.dirname(self.path) or "."
             fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
+            tmp = None
             self.save_error = None
             self.saved_at = time.time()
             return True
         except Exception as exc:
             self.save_error = str(exc)
             return False
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
 
     def get(self, key, default=None):
         with self._lock:

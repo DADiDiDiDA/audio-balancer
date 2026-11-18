@@ -67,6 +67,9 @@ class StatusGuard:
 def _watch_status(status_engine, muter, guard, config, cmds):
     """后台轮询：状态文件 + 配置变化 + 退出事件。"""
     last_mtime = 0.0
+    # 刚启动时核心可能还没写出状态文件（双击 exe 时两边几乎同时起），
+    # 直接按 status_age 判「核心已退出」会让界面 accidentally 自杀。
+    grace_until = time.time() + 12.0
     while True:
         st = ipc.read_status()
         if st:
@@ -84,8 +87,8 @@ def _watch_status(status_engine, muter, guard, config, cmds):
             muter.controlled = int(st.get("controlled") or 0)
             muter.muted = list(st.get("muted") or [])
             guard._s = dict(st.get("guard") or {})
-        # 核心进程结束 → UI 跟着退
-        if ipc.status_age() > 6:
+        # 核心进程结束 → UI 跟着退（启动宽限期内不看年龄）
+        if time.time() >= grace_until and ipc.status_age() > 6:
             cmds.put("quit")
             return
         try:
