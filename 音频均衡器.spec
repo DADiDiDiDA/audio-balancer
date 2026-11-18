@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('icon.ico', '.')]
 binaries = []
 hiddenimports = ['psutil', 'pystray', 'pystray._win32', 'ui_main', 'ipc',
-                 'gui', 'theme', 'ui_kit']
+                 'gui', 'theme', 'ui_kit', 'autostart']
 tmp_ret = collect_all('soundcard')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('comtypes')

@@ -13,6 +13,7 @@ from tkinter import ttk
 
 from PIL import Image, ImageFilter, ImageGrab, ImageTk
 
+import autostart
 import theme
 import ui_kit
 from theme import FONT
@@ -318,10 +319,10 @@ class AppWindow:
         else:
             cv.configure(bg=pal["sidebar"])
 
-        ui_kit.shape(cv, 24, 24, 38, 38, 19, fill=pal["accent"])
-        # 三根柱子垂直居中于圆心(43)：top = 43 - bh/2，不再让柱底都压在圆心
-        for bx, bh in ((32, 12), (39, 20), (46, 14)):
-            ui_kit.shape(cv, bx, 43 - bh / 2.0, 4, bh, 2, fill=pal["on_accent"])
+        # 与 icon.ico 同款：蓝色圆角方 + 三根白柱（比例照搬，保证标题栏/侧栏一致）
+        ui_kit.shape(cv, 24, 24, 38, 38, 9, fill=pal["accent"])
+        for bx, top, bot in ((32, 43, 55), (39, 35, 55), (46, 39, 55)):
+            ui_kit.shape(cv, bx, top, 5, bot - top, 2, fill=pal["on_accent"])
         cv.create_text(74, 34, text=APP_TITLE, font=(FONT, 12, "bold"),
                        fill=pal["text"], anchor="w")
         cv.create_text(74, 53, text="v" + VERSION, font=(FONT, 9),
@@ -593,11 +594,18 @@ class AppWindow:
                "只读系统音量滑块、绝不修改它；也不改各程序音量（自动静音例外：退出时按原值恢复）。",
                9, pal["dim"], width=w - 48, anchor="nw")
 
-        p.card(x, cy + 270, w, 100)
-        p.text(x + 24, cy + 294, "配置文件", 9, pal["dim"])
-        p.text(x + 24, cy + 314, (self.config.path or ""), 9, pal["sub"],
+        p.card(x, cy + 270, w, 188)
+        p.text(x + 24, cy + 292, "开机自启", 11, bold=True)
+        p.text(x + 24, cy + 316,
+               "开机时静默启动核心（托盘常驻、不弹界面），声音处理立即就绪。",
+               9, pal["sub"], width=w - 96, anchor="nw")
+        p.toggle(x + w - 24 - 46, cy + 290, autostart.is_enabled, self._on_autostart)
+
+        p.divider(x + 24, cy + 350, w - 48)
+        p.text(x + 24, cy + 366, "配置文件", 9, pal["dim"])
+        p.text(x + 24, cy + 386, (self.config.path or ""), 9, pal["sub"],
                width=w - 48, anchor="nw")
-        p.text(x + 24, cy + 350,
+        p.text(x + 24, cy + 422,
                "端到端延迟默认约 %d ms，可在「音频设备」里用缓冲滑块调节"
                % int(float(self.config.get("block_ms", 33)) * 2
                      + max(30, float(self.config.get("block_ms", 33)) + 18)),
@@ -814,6 +822,12 @@ class AppWindow:
 
     def _on_winvol_max(self, v):
         self._set("winvol_max_db", float(v))
+
+    def _on_autostart(self, on):
+        ok = autostart.set_enabled(bool(on))
+        self._set_foot("开机自启已开启" if ok and on else
+                       ("开机自启已关闭" if ok else "开机自启设置失败"),
+                       self.pal["sub"] if ok else self.pal["err"])
 
     def _on_block(self, v):
         """缓冲改动要重建会话才生效；拖动时别每格都重连，停手 0.6 秒再应用。"""
