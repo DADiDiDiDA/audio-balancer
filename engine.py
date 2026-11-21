@@ -30,6 +30,7 @@ from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
 from pycaw.pycaw import AudioSession, AudioUtilities  # noqa: F401
 import soundcard as sc
 
+import session
 from dsp import ClickGuard, DcBlocker, downmix_to_stereo
 from loudness import KWeighting, SlidingLUFS
 from wasapi_raw import RawPlayer
@@ -345,7 +346,7 @@ class Engine:
         # 诊断用：设置为 callable(x, y) 可拿到「采集到的输入」与「即将送出的输出」
         self.tap = None
         self.status = {
-            "running": False, "error": None,
+            "running": False, "error": None, "paused": None,
             "lufs": -70.0, "gain_db": 0.0, "pre_db": 0.0,
             "input": "-", "output": "-", "out_mode": "-",
             "underrun": 0, "buffered": 0, "waiting": False, "win_vol": 1.0,
@@ -464,10 +465,35 @@ class Engine:
             except Exception:
                 pass
 
+    def _rdp_blocked(self, cfg):
+        """远程桌面场景 + 用户没开「在远程桌面中接管」→ 不碰声音。
+
+        「不碰」是字面意思：不打开采集/播放设备、不处理、也不改系统默认输出。
+        这样 RDP 里的声音会原样走对面设备；用户把开关打开后才像本机一样接管。
+        """
+        return session.blocked(bool(cfg.get("rdp_takeover", False)))
+
+    def _set_pause(self, reason):
+        """暂停状态只发布一次，避免每秒刷一遍状态文件。"""
+        if reason:
+            if self.status.get("paused") == reason and not self.status.get("running"):
+                return
+            self._publish(running=False, error=None, paused=reason, waiting=False)
+        elif self.status.get("paused"):
+            self._publish(paused=None)
+
     def _supervise(self):
         ensure_com()
         backoff = 1.0
         while self._run:
+            cfg = self.config.snapshot()
+            if self._rdp_blocked(cfg):
+                self._set_pause("rdp")
+                # 0.5 秒看一次配置/会话状态：用户在界面上打开接管就立刻恢复
+                if self._stop.wait(0.5):
+                    self._stop.clear()
+                continue
+            self._set_pause(None)
             started = time.time()
             try:
                 self._session()
@@ -555,7 +581,7 @@ class Engine:
             except Exception:
                 win_vol = None
         self._q = q
-        self._publish(running=True, error=None,
+        self._publish(running=True, error=None, paused=None,
                       input=in_dev.name, output=out_dev.name)
 
         def capture():
@@ -784,6 +810,11 @@ class Engine:
         t2.start()
         while self._run and not self._stop.is_set():
             if not (t1.is_alive() and t2.is_alive()):
+                break
+            # 运行途中被远程桌面挤掉（或用户打开/关闭「接管远程桌面」）：
+            # 立刻收工回到暂停态，别继续占着 CABLE 和默认输出
+            if self._rdp_blocked(self.config.snapshot()):
+                self._stop.set()
                 break
             time.sleep(0.25)
         self._stop.set()

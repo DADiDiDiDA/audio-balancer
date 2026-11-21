@@ -17,6 +17,8 @@ from ctypes import POINTER, c_int, c_longlong, c_void_p, c_wchar_p
 from comtypes import CLSCTX_ALL, COMMETHOD, GUID, HRESULT, IUnknown, CoCreateInstance
 from pycaw.pycaw import AudioUtilities
 
+import session
+
 CLSID_POLICY = GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")
 CLSID_POLICY_VISTA = GUID("{294935CE-F637-4E7C-A41B-AB255460B862}")
 
@@ -131,6 +133,8 @@ class DeviceGuard:
         self.ticks = 0
         self._handled = None
         self._last_real = None
+        self._pre = None             # 接管前的真实默认设备 (id, name)，交还时用
+        self._rdp_released = False   # 已经为远程桌面交还过默认输出
         self._running = True
 
     # ---------- 生命周期 ----------
@@ -153,11 +157,24 @@ class DeviceGuard:
                 self.log("默认设备守护出错：%s" % msg)
 
     # ---------- 核心 ----------
+    def _rdp_blocked(self):
+        """远程桌面里不接管（用户没打开「在远程桌面中接管」时）。"""
+        try:
+            return session.blocked(bool(self.config.get("rdp_takeover", False)))
+        except Exception:
+            return False
+
     def _tick(self):
         dev_id, name = current_default()
         if not dev_id:
             return
         self.default_name = name
+
+        # 远程桌面场景：不接管，还要把之前改走的默认输出还回去
+        if self._rdp_blocked():
+            self._release_for_rdp(dev_id, name)
+            return
+        self._rdp_released = False
 
         # 默认已经是虚拟声卡：正常状态，记下来备用
         if is_virtual_name(name):
@@ -174,6 +191,8 @@ class DeviceGuard:
         if dev_id == self._handled:
             return
         self._handled = dev_id
+        # 记住「接管前的真实默认设备」：远程桌面交还时优先还给它
+        self._pre = (dev_id, name)
 
         want_back = self.virtual or self._fallback_virtual()
         # 1) 先把这个真实设备设为新的输出设备（引擎会重连到它）
@@ -195,6 +214,64 @@ class DeviceGuard:
             self.log("已把系统默认输出还原为「%s」" % want_back[1])
         else:
             self.error = "还原系统默认输出失败（可手动在 Windows 里改回）"
+
+    def _release_for_rdp(self, dev_id, name):
+        """远程桌面里按设置不接管：把被我们改成虚拟声卡的默认输出还回去。
+
+        只在「默认输出现在是虚拟声卡」时才动手——说明是我们（或上次运行）改的，
+        不还回去的话远程桌面这边就没有声音了。
+        """
+        self._handled = None
+        if self._rdp_released:
+            return
+        self._rdp_released = True
+        if not is_virtual_name(name):
+            self.log("远程桌面场景：按设置不接管（默认输出「%s」保持不动）"
+                     % (name or "未知"))
+            return
+        target = self._release_target()
+        if target is None:
+            self.error = "远程桌面：找不到可交还的真实输出设备"
+            return
+        if set_default_render(target[0]):
+            self.restored += 1
+            self.error = None
+            self.log("远程桌面场景：已把系统默认输出交还给「%s」（不接管）" % target[1])
+            self._notify("远程桌面：已交还系统默认输出（未接管）")
+        else:
+            self.error = "远程桌面：交还系统默认输出失败（可手动改回）"
+
+    def _release_target(self):
+        """挑一个「交还」用的真实输出设备：优先接管前的那个，其次远程音频。"""
+        cands = []
+        try:
+            for d in AudioUtilities.GetAllDevices():
+                nm = d.FriendlyName or ""
+                try:
+                    state = int(getattr(d.state, "value", d.state))
+                except Exception:
+                    state = 1
+                if state != 1 or is_virtual_name(nm):
+                    continue
+                cands.append((d.id, nm))
+        except Exception:
+            return None
+        if not cands:
+            return None
+        want = ""
+        for src in ((self._pre or (None, ""))[1],
+                    self.config.get("output_device", "") or ""):
+            if (src or "").strip():
+                want = src.strip().lower()
+                break
+        for did, nm in cands:
+            if want and nm.strip().lower() == want:
+                return (did, nm)
+        for did, nm in cands:
+            low = nm.lower()
+            if "remote" in low or "远程" in nm or "rdp" in low:
+                return (did, nm)
+        return cands[0]
 
     def _fallback_virtual(self):
         """没见过虚拟默认设备时（例如程序启动时默认已是耳机），
@@ -231,4 +308,5 @@ class DeviceGuard:
             "virtual": (self.virtual or (None, ""))[1],
             "restored": self.restored,
             "error": self.error,
+            "rdp": self._rdp_blocked(),
         }

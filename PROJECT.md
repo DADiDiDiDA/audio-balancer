@@ -111,7 +111,8 @@ WASAPI 补静音就是那声轻微「刺啦」。
 |---|---|
 | `main.py` | 核心进程入口：单实例、托盘、控制线程、看门狗、按需拉起 UI |
 | `muter.py` | 自动静音：按名单与两条规则（挂机静音 / 前台压制其它）管理会话音量，退出时恢复原值 |
-| `device_guard.py` | 默认输出守护：用户改默认输出后自动接管为输出设备并把默认改回 CABLE |
+| `device_guard.py` | 默认输出守护：用户改默认输出后自动接管为输出设备并把默认改回 CABLE；远程桌面场景下按设置交还默认输出、不再接管 |
+| `session.py` | 会话判定：本进程是否在 RDP 会话里、控制台会话是否已被远程桌面挤掉（`SM_REMOTESESSION` + `WTSQuerySessionInformation`），供引擎/守护/静音统一使用 |
 | `autostart.py` | 开机自启：读写 `HKCU\...\Run`，以 `--minimized` 启动核心 |
 
 ### 界面
@@ -161,6 +162,12 @@ WASAPI 补静音就是那声轻微「刺啦」。
 - **多线程异常必须上报**：采集/播放线程的异常写入 `_thread_error`，会话结束抛出；
   早期版本吞异常导致界面显示"运行中"却全程静音，排查极其困难。
 - **UI 不碰音频 COM**：设备列表由核心提供，UI 进程不初始化 pycaw/soundcard，避免 COM 线程模式冲突。
+- **远程桌面默认不接管（v1.7.1）**：RDP 会话和控制台是两套音频上下文，程序在 RDP 里抢 CABLE
+  只会让远程的声音被送到本机耳机上（对面反而没声音）。所以 `session.blocked()` 一成立，
+  引擎直接进暂停态（不建设备、不处理、状态 `paused="rdp"`）、设备守护把之前改走的默认输出
+  交还真实设备、自动静音也停手；用户在「音频设备」页打开 `rdp_takeover` 才照常接管。
+  「控制台会话已断开」（`WTS_CONNECTSTATE` = 4）也算远程场景——这时本机没人听声音。
+  暂停态每 0.5s 复查一次配置，开关一改就恢复，不需要重启；运行途中被挤掉会在 0.25s 内收工。
 
 ---
 
@@ -171,6 +178,7 @@ WASAPI 补静音就是那声轻微「刺啦」。
 # 语法与守卫
 python -m py_compile *.py
 python verify_engine.py          # 改 engine.py 后必跑
+python verify_rdp.py             # 改 session/远程桌面相关逻辑后必跑（不碰真实设备）
 
 # 打包（onefile，必须 --clean 否则秒过不更新 exe）
 python -m PyInstaller 音频均衡器.spec --noconfirm --clean

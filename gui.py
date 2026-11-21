@@ -19,7 +19,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 SIDE_W = 192
 
@@ -426,10 +426,18 @@ class AppWindow:
         st = self.engine.status
         running = bool(st.get("running"))
         err = st.get("error")
-        color = pal["err"] if (err or not running) else pal["ok"]
+        paused = st.get("paused")
+        if paused == "rdp":
+            color, label = pal["warn"], "远程桌面 · 已暂停"
+        elif err:
+            color, label = pal["err"], "链路中断"
+        elif not running:
+            color, label = pal["err"], "未运行"
+        else:
+            color, label = pal["ok"], "运行中"
         dy = H - 44
         ui_kit.shape(cv, 26, dy - 4, 9, 9, 4.5, fill=color)
-        cv.create_text(44, dy, text=("链路中断" if err else ("运行中" if running else "未运行")),
+        cv.create_text(44, dy, text=label,
                        anchor="w", font=(FONT, 10), fill=pal["sub"])
 
     def _render_footer(self, p, x, w, H):
@@ -654,7 +662,7 @@ class AppWindow:
                8, pal["dim"])
 
         ty = cy + 244
-        p.card(x, ty, w, 144)
+        p.card(x, ty, w, 180)
         p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
         p.help(x + 22 + ui_kit.text_width("自动接管系统默认输出", 11, True) + 12, ty + 26,
                "你在系统里把默认输出点到耳机时，本程序自动把耳机设为输出设备，"
@@ -662,13 +670,22 @@ class AppWindow:
         p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
                  self._on_follow)
         p.text(x + 22, ty + 52,
-               "换耳机时先在系统里把默认输出点成耳机，本程序会自动接管为输出设备，"
-               "并把系统默认改回虚拟声卡——下次换耳机再点一下即可。",
+               "系统里把默认输出点成耳机时，自动把它设为输出设备，再把系统默认改回虚拟声卡。",
                9, pal["sub"], width=w - 48, anchor="nw")
-        self.m_default = p.text(x + 22, ty + 118, "系统默认输出：—", 9, pal["dim"])
+        p.divider(x + 22, ty + 78, w - 44)
+        p.text(x + 22, ty + 96, "在远程桌面中接管", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("在远程桌面中接管", 11, True) + 12, ty + 96,
+               "关掉（默认）：远程桌面会话里本程序完全不碰声音——不处理响度、不改默认输出，"
+               "声音直接送到对面的设备；打开：远程桌面里也像本机一样接管（需要把默认输出改成 CABLE）。")
+        p.toggle(x + w - 24 - 46, ty + 90,
+                 lambda: bool(cfg.get("rdp_takeover", False)), self._on_rdp)
+        p.text(x + 22, ty + 118,
+               "关闭时远程桌面里不处理声音、也不改系统默认输出。",
+               9, pal["sub"], width=w - 48, anchor="nw")
+        self.m_default = p.text(x + 22, ty + 152, "系统默认输出：—", 9, pal["dim"])
 
-        vc = ty + 156
-        p.card(x, vc, w, 204)
+        vc = ty + 192
+        p.card(x, vc, w, 168)
         p.text(x + 22, vc + 26, "用 Windows 音量滑块控制声音大小", 11, bold=True)
         p.help(x + 22 + ui_kit.text_width("用 Windows 音量滑块控制声音大小", 11, True) + 12,
                vc + 26,
@@ -690,11 +707,11 @@ class AppWindow:
                 self._on_winvol_max, fmt=lambda v: "+%.1f dB" % v,
                 note="100% 时",
                 tip="滑块拉到 100% 时额外增加多少 dB。加太多会让软限幅一直在工作，听感发毛。")
-        p.text(x + 22, vc + 162,
-               "默认：滑块 20% 是正常音量，往上到 100% 逐渐增大（最多 +10dB）。"
-               "觉得整体偏大/偏小，调上面两项即可。", 9, pal["dim"], width=w - 44)
+        p.text(x + 22, vc + 138,
+               "默认 20% = 正常音量，100% = +10dB；觉得整体偏大/偏小就调上面两项。",
+               9, pal["dim"], width=w - 44)
 
-        by = vc + 216
+        by = vc + 180
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
         # 提示放按钮同一行右侧，不额外占高度，避免和底部状态栏重叠
@@ -788,7 +805,11 @@ class AppWindow:
         gain = float(st.get("gain_db", 0))
         err = st.get("error")
         waiting = bool(st.get("waiting"))
-        if self.page == "loudness":
+        paused = st.get("paused")
+        if paused == "rdp" and not bool(st.get("running")):
+            self._set_foot("远程桌面会话中：按设置不接管声音（可在「音频设备」页开启）",
+                           pal["warn"])
+        elif self.page == "loudness":
             cv = self._painter.cv if self._painter else None
             if cv is not None:
                 try:
@@ -830,6 +851,8 @@ class AppWindow:
         line = "系统默认输出：%s" % (g["default"] or "—")
         if g.get("error"):
             line += "　⚠ %s" % g["error"]
+        elif g.get("rdp"):
+            line += "　· 远程桌面：不接管"
         elif g.get("virtual"):
             line += "　（虚拟声卡 · 正常）"
         try:
@@ -983,6 +1006,12 @@ class AppWindow:
 
     def _on_follow(self, v):
         self._set("auto_follow_default", bool(v))
+
+    def _on_rdp(self, v):
+        self._set("rdp_takeover", bool(v))
+        self._set_foot("远程桌面中也会接管声音" if v else
+                       "远程桌面中不再接管声音（声音原样直通）",
+                       self.pal["sub"])
 
     def _on_winvol(self, v):
         self._set("use_windows_volume", bool(v))

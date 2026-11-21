@@ -15,6 +15,7 @@ import traceback
 
 import ipc
 import muter as muter_mod          # 先 import：pycaw(comtypes) 必须先于 soundcard
+import session
 import theme
 from config import Config, app_dir
 from device_guard import DeviceGuard
@@ -98,6 +99,9 @@ def build_tray(config, stop):
     def toggle_mute(_icon, _item):
         config.set("mute_enabled", not config.get("mute_enabled", True))
 
+    def toggle_rdp(_icon, _item):
+        config.set("rdp_takeover", not config.get("rdp_takeover", False))
+
     def quit_app(_icon, _item):
         ipc.set_event(ipc.EV_UI_QUIT)
         stop.set()
@@ -109,6 +113,8 @@ def build_tray(config, stop):
                  checked=lambda i: bool(config.get("enabled", True))),
         MenuItem("自动静音", toggle_mute,
                  checked=lambda i: bool(config.get("mute_enabled", True))),
+        MenuItem("远程桌面中也接管", toggle_rdp,
+                 checked=lambda i: bool(config.get("rdp_takeover", False))),
         Menu.SEPARATOR,
         MenuItem("退出", quit_app),
     )
@@ -141,13 +147,14 @@ def control_loop(config, engine, muter, guard, stop):
     last_guard = 0.0
     last_status = 0.0
     last_devices = 0.0
+    rdp_restored = False
     devices = {"inputs": [], "outputs": []}
     try:
         mtime = os.path.getmtime(config.path)
     except Exception:
         mtime = 0.0
     keys = ("input_device", "output_device", "block_ms", "use_windows_volume",
-            "downmix")
+            "downmix", "rdp_takeover")
     while not stop.is_set():
         try:
             # 1) 设备守护优先：换默认输出时会话枚举很慢，放后面会拖住它
@@ -157,8 +164,24 @@ def control_loop(config, engine, muter, guard, stop):
                     last_guard = now
                     set_phase("guard.tick")
                     guard.tick()
-            set_phase("muter.tick")
-            muter.tick(time.time())
+            # 远程桌面场景（默认）：自动静音也要停手，并把之前压的音量还回去
+            if session.blocked(bool(config.get("rdp_takeover", False))):
+                if not rdp_restored:
+                    rdp_restored = True
+                    try:
+                        muter.restore()
+                    except Exception:
+                        pass
+                    muter.in_game = False
+                    muter.controlled = 0
+                    muter.muted = []
+                    log("远程桌面场景：不接管声音，自动静音已暂停")
+            else:
+                if rdp_restored:
+                    rdp_restored = False
+                    log("回到本机会话：恢复接管声音")
+                set_phase("muter.tick")
+                muter.tick(time.time())
             set_phase("idle")
 
             err = engine.status.get("error")
@@ -236,13 +259,18 @@ def main():
         run_ui()
         return
 
+    config = Config()
     if not ipc.acquire_mutex(ipc.MUTEX_CORE):
         # 已有核心进程：叫它把界面拉出来，绝不再起一个引擎/托盘
-        ipc.set_event(ipc.EV_SHOW_UI)
+        if session.blocked(bool(config.get("rdp_takeover", False))):
+            # 远程桌面里默认不接管：不去别人（本机控制台）的会话里弹窗口
+            log("远程桌面场景：已有实例在运行，本会话按设置不接管（退出）")
+        else:
+            ipc.set_event(ipc.EV_SHOW_UI)
         return
 
     log("===== 核心启动 =====")
-    config = Config()
+    log("运行在%s" % session.describe())
     engine = Engine(config)
     muter = Muter(config)
     guard = DeviceGuard(config, engine, on_event=log, log=log)
