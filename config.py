@@ -34,6 +34,9 @@ DEFAULTS = {
     # 端到端延迟 ≈ 块长 + 队列余量(≤1块) + WASAPI 缓冲(块长+10)。
     "block_ms": 15,
     "downmix": True,
+    # WASAPI 输出缓冲（ms）。0 = 自动（两块 + 6ms）。手调低于两块会更容易「刺啦」，
+    # 只在明确要极限低延迟时才动。
+    "out_buffer_ms": 0,
     # 用 Windows 音量滑块（CABLE Input 那个）控制最终音量。
     # 启动时会把 CABLE 的音量设为 100%，之后滑块直接作为输出增益。
     "use_windows_volume": True,

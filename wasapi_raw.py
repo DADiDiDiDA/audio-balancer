@@ -119,6 +119,10 @@ class RawPlayer:
         self._bufsize = 0
         self._started = False
         self.used_raw = False
+        # 欠载诊断：starves = 进 play() 时缓冲已空（真的欠载）；min_pad_ms = 入口最小剩余
+        self.starves = 0
+        self.writes = 0
+        self.min_pad_ms = 1e9
 
     def open(self):
         dev = _find_device(self.device_name)
@@ -166,6 +170,16 @@ class RawPlayer:
         frames = arr.shape[0]
         pos = 0
         deadline = time.time() + 5.0
+        # 入口剩余量：这才是"欠载"判据（缓冲写满只是正常的流控）
+        try:
+            pad0_ms = int(self._client.GetCurrentPadding()) * 1000.0 / float(self.samplerate)
+            if self.writes > 0 and pad0_ms < self.min_pad_ms:
+                self.min_pad_ms = pad0_ms
+            if pad0_ms <= 0.0 and self.writes > 0:
+                self.starves += 1       # 首次调用时缓冲本来就是空的，不算欠载
+            self.writes += 1
+        except Exception:
+            pass
         while pos < frames:
             pad = int(self._client.GetCurrentPadding())
             avail = self._bufsize - pad

@@ -222,6 +222,23 @@ def soft_limit(x, ceiling_db):
     return np.where(a > knee, np.sign(x) * limited, x)
 
 
+def apply_gain_ramp(x, total, state):
+    """输出增益按样本线性过渡，避免「块间增益台阶」造成的拉链噪声。
+
+    原来每个块用一个新算出的常量增益：块长 15ms 时，增益每块一跳就等于
+    波形上出现一个阶跃，每秒 66 次 —— 听感是很轻但持续的「刺啦」。
+    这里让增益在块内从上一块的值线性走到本块的值，块与块就接上了。
+    """
+    prev = state.get("g_total")
+    if prev is None:
+        prev = total
+    state["g_total"] = total
+    if abs(total - prev) <= 1e-6 or x.shape[0] < 2:
+        return x * total
+    ramp = np.linspace(prev, total, x.shape[0], dtype=np.float64)[:, None]
+    return x * ramp
+
+
 def volume_curve(v, ref=0.20, max_db=10.0):
     """Windows 音量滑块 0..1 → 输出增益。
 
@@ -292,6 +309,16 @@ class _Out:
             self.raw.play(data)
         else:
             self.sc.play(data)
+
+    @property
+    def starves(self):
+        """输出缓冲被写空的累计次数（RAW 模式才有；回退模式给 0）。"""
+        return self.raw.starves if self.raw is not None else 0
+
+    @property
+    def min_pad_ms(self):
+        """观察到的最小剩余缓冲（ms）。贴着 0 跑就说明没有余量。"""
+        return self.raw.min_pad_ms if self.raw is not None else 1e9
 
     def __exit__(self, *exc):
         try:
@@ -500,12 +527,20 @@ class Engine:
             sess_dev = None
         block_ms = self._num(cfg, "block_ms", 20, 10, 100)
         blk = int(round(SR * block_ms / 1000.0))
-        # WASAPI 输出缓冲 = 一块 + 8ms 抖动余量。不能再小：输出去欠载时 WASAPI 会
-        # 自己补静音，那一声咔哒我们管不了（ClickGuard 只管输入侧）。
-        deadband_ms = max(20, int(block_ms) + 8)
+        # WASAPI 输出缓冲 = 两块 + 6ms 抖动余量。为什么不是「一块 + 8ms」：
+        # 采集端按设备周期成块交付，块间会有几毫秒到十几毫秒的抖动；余量只有
+        # 8~9ms 时缓冲会被写空，WASAPI 补静音 —— 听感就是持续的轻微「刺啦」。
+        # 实测 11ms 块 + 20ms 缓冲：播放时每秒约 9 次写空；改成两块+6ms 后归零。
+        # 想更跟手可以在高级设置里用 out_buffer_ms 手动压回去。
+        auto_buf = max(24, int(block_ms) * 2 + 6)
+        user_buf = int(self._num(cfg, "out_buffer_ms", 0, 0, 400))
+        # 用户显式指定时才允许压小（低于两块就容易刺啦，这里仍留一点底线）
+        deadband_ms = max(int(block_ms) + 4, user_buf) if user_buf > 0 else auto_buf
         self.status["block_ms"] = int(block_ms)
-        # 队列只留一块余量吸收抖动：延迟 ≤ 一块，且欠载有淡出兜底不会咔哒
-        q = queue.Queue(maxsize=2)
+        self.status["buffer_ms"] = int(deadband_ms)
+        # 队列只留一块：抖动的吸收交给设备缓冲（那里已经是两块），
+        # 队列再堆两块等于白加 2×块长 的延迟。
+        q = queue.Queue(maxsize=1)
 
         # Windows 音量滑块（CABLE Input 的端点音量）对回环采集不起作用，
         # 必须在引擎里主动读出来当输出增益用，用户才能用系统音量控大小。
@@ -585,16 +620,20 @@ class Engine:
                     # 阈值 2 秒：正常音乐/视频里的停顿不会误触发。
                     if silent_for > 2.0:
                         time.sleep(0.02)
-                    while q.full():
+                    # 队列只有一格：满了就等（正常节流），真的等超时才丢旧的换新的，
+                    # 并给下一块打上 gap 标记 —— 播放端据此做 2ms 淡化，不会咔哒。
+                    try:
+                        q.put((d, False), timeout=0.2)
+                    except queue.Full:
                         try:
                             q.get_nowait()
                             state["underrun"] += 1
                         except queue.Empty:
-                            break
-                    try:
-                        q.put(d, timeout=0.2)
-                    except queue.Full:
-                        pass
+                            pass
+                        try:
+                            q.put((d, True), timeout=0.05)
+                        except queue.Full:
+                            pass
             except Exception:
                 self._thread_error = traceback.format_exc()
                 self._last_trace = self._thread_error
@@ -621,12 +660,17 @@ class Engine:
                         # （原来只在会话开始时读一次，这就是"勾了直通却没变化"的原因）
                         cfg = self.config.snapshot()
                         try:
-                            block = q.get(timeout=0.05)
+                            item = q.get(timeout=0.05)
                         except queue.Empty:
                             state["underrun"] += 1
                             # 不能硬切静音：从当前电平淡出，否则就是一声咔哒
                             pl.play(guard.silence(blk).astype(np.float32))
                             continue
+                        # 采集端会显式标出「这块之前丢过块」→ 接缝必然不连续
+                        if isinstance(item, tuple):
+                            block, gap = item
+                        else:
+                            block, gap = item, False
 
                         x = np.asarray(block, dtype=np.float64)
                         if x.ndim == 1:
@@ -676,7 +720,7 @@ class Engine:
                         if bool(cfg.get("passthrough", False)):
                             # 直通：完全不处理，原样搬运（排查 / 只要自动静音时用）
                             state["gain"] = 0.0
-                            y = x * pre * vol_gain
+                            y = apply_gain_ramp(x, pre * vol_gain, state)
                         else:
                             gate = self._num(cfg, "silence_gate_lufs", -60, -90, -20)
                             enabled = bool(cfg.get("enabled", True))
@@ -704,11 +748,14 @@ class Engine:
                             coeff = 1.0 - float(np.exp(-dt / max(tau, 1e-3)))
                             state["gain"] += (desired - state["gain"]) * coeff
 
-                            y = x * pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain
+                            # 增益按样本线性过渡：块间没有台阶，就不会有拉链噪声
+                            y = apply_gain_ramp(
+                                x, pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain,
+                                state)
                             y = soft_limit(y, self._num(cfg, "limiter_ceiling_db", -1.0, -6, 0))
 
-                        # 块首交叉淡化：接缝不连续（丢块/增益突变）也不会咔哒
-                        y = guard.smooth(y)
+                        # 只在「真的不连续」时才在块首淡化；连续音频原样通过
+                        y = guard.smooth(y, discontinuity=gap)
                         if self.tap is not None:
                             try:
                                 self.tap(x, y)   # 抓的是真正送出的（已平滑）
@@ -722,7 +769,9 @@ class Engine:
                             self._publish(lufs=state["lufs"], gain_db=state["gain"],
                                           pre_db=state.get("pre_db", 0.0),
                                           win_vol=state.get("win_vol", 1.0),
-                                          underrun=state["underrun"], buffered=q.qsize())
+                                          underrun=state["underrun"], buffered=q.qsize(),
+                                          out_starves=pl.starves,
+                                          out_pad_ms=round(pl.min_pad_ms, 1))
             except Exception:
                 self._thread_error = traceback.format_exc()
                 self._last_trace = self._thread_error

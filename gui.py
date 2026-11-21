@@ -19,7 +19,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 SIDE_W = 192
 
@@ -530,7 +530,8 @@ class AppWindow:
         p.field(x + 22, cy + 164, w - 44, "缓冲（越小延迟越低；10ms 已很稳）",
                 blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v)
         p.text(x + 22, cy + 212,
-               "当前端到端延迟约 %.0f ms（采集 1 块 + 队列 1 块 + 设备缓冲）" % (blk * 3 + 8),
+               "当前端到端延迟约 %.0f ms（采集/队列 2 块 + 设备缓冲）"
+               % (blk * 2 + max(24, blk * 2 + 6)),
                8, pal["dim"])
 
         ty = cy + 244
@@ -609,7 +610,8 @@ class AppWindow:
                width=w - 48, anchor="nw")
         p.text(x + 24, cy + 422,
                "端到端延迟默认约 %d ms，可在「音频设备」里用缓冲滑块调节"
-               % int(float(self.config.get("block_ms", 15)) * 3 + 8),
+               % int(float(self.config.get("block_ms", 15)) * 2
+                     + max(24, float(self.config.get("block_ms", 15)) * 2 + 6)),
                9, pal["dim"])
 
     # ---------------------------------------------------------------- 实时刷新

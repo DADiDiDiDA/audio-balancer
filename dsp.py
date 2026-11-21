@@ -437,7 +437,7 @@ class VoiceEnhancer:
 
 
 class ClickGuard:
-    """块边界平滑，消除欠载/丢块/增益突变造成的咔哒声。
+    """块边界去咔哒，只在**真正不连续**时才动手。
 
     咔哒的本质是波形出现阶跃（相邻采样跳变很大）。三个来源：
       1. 队列欠载时直接输出整块 0 —— 从有声瞬间跳到 0；
@@ -445,24 +445,38 @@ class ClickGuard:
       3. 增益/限幅参数突变 —— 块首样本与上块尾样本对不上。
 
     做法：
-      · smooth()：每块开头用 fade_ms 与上一块的最后一个样本做交叉淡化。
-        块本身连续时几乎无影响；不连续时正好抹平接缝。
+      · smooth()：先比较「块首样本」和「上块末样本」。连续时**原样通过、一个采样都不改**；
+        只有跳变明显超出这段音频自身的正常步进（上块块内最大步进 ×2.5）时才淡化，
+        或者调用方明确告知「这块前面被丢过 / 刚从静音恢复」（discontinuity=True / 内部静音标记）。
       · silence()：欠载时输出「从上次电平淡出到 0」的块，而不是硬切。
-    这样即使把缓冲压到很低、偶尔欠载，也听不到咔哒。
+
+    ⚠️ 历史教训（v1.6.3）：最早的版本对**每一块**都无条件交叉淡化，等于每 15 ms
+    把波形朝「上块最后一个采样值」拉 2 ms —— 对恒定电平无所谓，对真实波形就是
+    周期性挖洞：1 kHz 正弦实测失真 -13 dB，听感是持续的轻微「刺啦」。
+    所以「是否连续」必须真的判断，不能靠淡化碰运气。
     """
 
-    def __init__(self, samplerate, fade_ms=2.0, channels=2):
+    def __init__(self, samplerate, fade_ms=2.0, channels=2,
+                 disc_factor=2.5, disc_floor=0.05):
         self.channels = int(channels)
         self.n = max(2, int(float(samplerate) * float(fade_ms) / 1000.0))
         self._up = np.linspace(0.0, 1.0, self.n, dtype=np.float64)[:, None]
         self._down = self._up[::-1].copy()
         self.last = None          # 上一块最后一个样本 (channels,)
+        self.disc_factor = float(disc_factor)
+        self.disc_floor = float(disc_floor)
+        self._prev_step = 0.0     # 上块块内最大相邻采样步进（衡量"正常步进"）
+        self._limit = self.disc_floor
+        self._muted = False       # 上一块是欠载静音 → 恢复时必然不连续
+        self.fades = 0            # 实际触发淡化的次数（诊断用）
 
     def reset(self):
         self.last = None
+        self._prev_step = 0.0
+        self._limit = self.disc_floor
+        self._muted = False
 
-    def smooth(self, block):
-        """块首交叉淡化到上一块尾部。返回新数组（不改调用方的数据）。"""
+    def _prepare(self, block):
         b = np.asarray(block, dtype=np.float64)
         if b.ndim == 1:
             b = b[:, None]
@@ -471,13 +485,29 @@ class ClickGuard:
                 b = b[:, :self.channels]
             else:
                 b = np.pad(b, ((0, 0), (0, self.channels - b.shape[1])))
+        return b
+
+    def smooth(self, block, discontinuity=False):
+        """连续时原样返回（零改动）；检测到/被告知不连续才在块首交叉淡化。"""
+        b = self._prepare(block)
         out = b.copy()
-        if self.last is not None and out.shape[0] > 0:
-            n = min(self.n, out.shape[0])
-            ramp = self._up[:n]
-            out[:n] = out[:n] * ramp + self.last[None, :] * (1.0 - ramp)
-        if out.shape[0] > 0:
+        frames = out.shape[0]
+        if self.last is not None and frames > 0:
+            step = float(np.max(np.abs(out[0] - self.last)))
+            if discontinuity or self._muted or step > self._limit:
+                n = min(self.n, frames)
+                ramp = self._up[:n]
+                out[:n] = out[:n] * ramp + self.last[None, :] * (1.0 - ramp)
+                self.fades += 1
+        if frames > 0:
             self.last = out[-1].copy()
+        # 记录本块"正常步进"，作为下一块的连续性判据
+        if frames > 1:
+            d = np.diff(b, axis=0)
+            m = float(np.max(np.abs(d)))
+            self._prev_step = m if np.isfinite(m) else 0.0
+            self._limit = max(self.disc_floor, self.disc_factor * self._prev_step)
+        self._muted = False
         return out
 
     def silence(self, frames):
@@ -488,13 +518,14 @@ class ClickGuard:
             n = min(self.n, frames)
             out[:n] = self.last[None, :] * self._down[:n]
         self.last = np.zeros(self.channels, dtype=np.float64)
+        self._prev_step = 0.0
+        self._limit = self.disc_floor
+        self._muted = True
         return out
 
     def fade_to_zero(self, block):
         """块尾淡出到 0（停止/切设备前用）。"""
-        b = np.asarray(block, dtype=np.float64).copy()
-        if b.ndim == 1:
-            b = b[:, None]
+        b = self._prepare(block).copy()
         if b.shape[0] > 0:
             n = min(self.n, b.shape[0])
             b[-n:] = b[-n:] * self._down[self.n - n:]
