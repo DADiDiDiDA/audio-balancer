@@ -30,7 +30,7 @@ from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
 from pycaw.pycaw import AudioSession, AudioUtilities  # noqa: F401
 import soundcard as sc
 
-from dsp import DcBlocker
+from dsp import ClickGuard, DcBlocker
 from loudness import KWeighting, SlidingLUFS
 from wasapi_raw import RawPlayer
 
@@ -49,6 +49,37 @@ def ensure_com():
     """每个用 soundcard 的线程都必须自己初始化 COM（单元是线程级的）。"""
     hr = ctypes.windll.ole32.CoInitializeEx(None, 0)   # MTA
     return (hr + 2 ** 32) not in (0, 0x80010106)
+
+
+def boost_current_thread():
+    """把当前音频线程提到最高优先级。
+
+    WASAPI 的块周期只有 10~20ms，线程被普通优先级调度拖一下（几 ms）就会
+    在采集端丢样本、在输出端欠载——这正是「块长调小就咔哒」的主要来源。
+    提到 TIME_CRITICAL 后，同样的小块长就稳得多了。
+    """
+    try:
+        k = ctypes.windll.kernel32
+        h = k.GetCurrentThread()
+        k.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        k.SetThreadPriority(h, 15)          # THREAD_PRIORITY_TIME_CRITICAL
+    except Exception:
+        pass
+
+
+def set_timer_resolution():
+    """timeBeginPeriod(1)：让 sleep/等待的精度从 15.6ms 提到 1ms。"""
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
+def restore_timer_resolution():
+    try:
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
 
 VIRTUAL_HINTS = ("cable", "vb-audio", "voice", "虚拟", "stereo mix")
 
@@ -384,9 +415,12 @@ class Engine:
             sess_dev = None
         block_ms = self._num(cfg, "block_ms", 20, 10, 100)
         blk = int(round(SR * block_ms / 1000.0))
-        deadband_ms = max(24, int(block_ms) + 10)   # WASAPI 缓冲 ≈ 一块 + 小余量
+        # WASAPI 输出缓冲 = 一块 + 8ms 抖动余量。不能再小：输出去欠载时 WASAPI 会
+        # 自己补静音，那一声咔哒我们管不了（ClickGuard 只管输入侧）。
+        deadband_ms = max(20, int(block_ms) + 8)
         self.status["block_ms"] = int(block_ms)
-        q = queue.Queue(maxsize=3)                # 留一块余量吸收抖动，额外延迟 ≤ 一块
+        # 队列只留一块余量吸收抖动：延迟 ≤ 一块，且欠载有淡出兜底不会咔哒
+        q = queue.Queue(maxsize=2)
 
         # Windows 音量滑块（CABLE Input 的端点音量）对回环采集不起作用，
         # 必须在引擎里主动读出来当输出增益用，用户才能用系统音量控大小。
@@ -406,6 +440,7 @@ class Engine:
 
         def capture():
             ensure_com()
+            boost_current_thread()
             rec = None
             silent_for = 0.0
             last_sess_check = 0.0
@@ -474,10 +509,12 @@ class Engine:
                     except Exception:
                         pass
 
-        silence = np.zeros((blk, CHANNELS), dtype=np.float32)
+        # 块边界平滑：欠载/丢块/增益突变都不再产生阶跃咔哒，代价只是每块开头 2ms 交叉
+        guard = ClickGuard(SR, fade_ms=2.0, channels=CHANNELS)
 
         def playback():
             ensure_com()
+            boost_current_thread()
             last = time.time()
             try:
                 with _Out(out_dev, buffer_ms=deadband_ms) as pl:
@@ -490,7 +527,8 @@ class Engine:
                             block = q.get(timeout=0.05)
                         except queue.Empty:
                             state["underrun"] += 1
-                            pl.play(silence)
+                            # 不能硬切静音：从当前电平淡出，否则就是一声咔哒
+                            pl.play(guard.silence(blk).astype(np.float32))
                             continue
 
                         x = np.asarray(block, dtype=np.float64)
@@ -572,9 +610,11 @@ class Engine:
                             y = x * pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain
                             y = soft_limit(y, self._num(cfg, "limiter_ceiling_db", -1.0, -6, 0))
 
+                        # 块首交叉淡化：接缝不连续（丢块/增益突变）也不会咔哒
+                        y = guard.smooth(y)
                         if self.tap is not None:
                             try:
-                                self.tap(x, y)
+                                self.tap(x, y)   # 抓的是真正送出的（已平滑）
                             except Exception:
                                 pass
                         pl.play(np.ascontiguousarray(y, dtype=np.float32))
@@ -591,6 +631,7 @@ class Engine:
                 self._last_trace = self._thread_error
                 self._stop.set()
 
+        set_timer_resolution()     # 1ms 定时精度：小块长才稳
         t1 = threading.Thread(target=capture, name="Cap", daemon=True)
         t2 = threading.Thread(target=playback, name="Play", daemon=True)
         t1.start()
@@ -602,6 +643,7 @@ class Engine:
         self._stop.set()
         t1.join(timeout=1.5)
         t2.join(timeout=1.5)
+        restore_timer_resolution()
         self._q = None
         # 工作线程挂了必须把现场抛出去：否则界面永远显示 running=True、
         # 响度永远是初值，而日志里什么都没有（这次排查就是被这个坑的）

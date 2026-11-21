@@ -434,3 +434,69 @@ class VoiceEnhancer:
             "switching": self._pending is not None,
         }
 
+
+
+class ClickGuard:
+    """块边界平滑，消除欠载/丢块/增益突变造成的咔哒声。
+
+    咔哒的本质是波形出现阶跃（相邻采样跳变很大）。三个来源：
+      1. 队列欠载时直接输出整块 0 —— 从有声瞬间跳到 0；
+      2. 采集端队列满时整块丢弃 —— 剩下的块与上一块接缝不连续；
+      3. 增益/限幅参数突变 —— 块首样本与上块尾样本对不上。
+
+    做法：
+      · smooth()：每块开头用 fade_ms 与上一块的最后一个样本做交叉淡化。
+        块本身连续时几乎无影响；不连续时正好抹平接缝。
+      · silence()：欠载时输出「从上次电平淡出到 0」的块，而不是硬切。
+    这样即使把缓冲压到很低、偶尔欠载，也听不到咔哒。
+    """
+
+    def __init__(self, samplerate, fade_ms=2.0, channels=2):
+        self.channels = int(channels)
+        self.n = max(2, int(float(samplerate) * float(fade_ms) / 1000.0))
+        self._up = np.linspace(0.0, 1.0, self.n, dtype=np.float64)[:, None]
+        self._down = self._up[::-1].copy()
+        self.last = None          # 上一块最后一个样本 (channels,)
+
+    def reset(self):
+        self.last = None
+
+    def smooth(self, block):
+        """块首交叉淡化到上一块尾部。返回新数组（不改调用方的数据）。"""
+        b = np.asarray(block, dtype=np.float64)
+        if b.ndim == 1:
+            b = b[:, None]
+        if b.shape[1] != self.channels:
+            if b.shape[1] > self.channels:
+                b = b[:, :self.channels]
+            else:
+                b = np.pad(b, ((0, 0), (0, self.channels - b.shape[1])))
+        out = b.copy()
+        if self.last is not None and out.shape[0] > 0:
+            n = min(self.n, out.shape[0])
+            ramp = self._up[:n]
+            out[:n] = out[:n] * ramp + self.last[None, :] * (1.0 - ramp)
+        if out.shape[0] > 0:
+            self.last = out[-1].copy()
+        return out
+
+    def silence(self, frames):
+        """欠载块：从上次电平短淡出到 0，避免阶跃。"""
+        frames = int(frames)
+        out = np.zeros((frames, self.channels), dtype=np.float64)
+        if self.last is not None and frames > 0:
+            n = min(self.n, frames)
+            out[:n] = self.last[None, :] * self._down[:n]
+        self.last = np.zeros(self.channels, dtype=np.float64)
+        return out
+
+    def fade_to_zero(self, block):
+        """块尾淡出到 0（停止/切设备前用）。"""
+        b = np.asarray(block, dtype=np.float64).copy()
+        if b.ndim == 1:
+            b = b[:, None]
+        if b.shape[0] > 0:
+            n = min(self.n, b.shape[0])
+            b[-n:] = b[-n:] * self._down[self.n - n:]
+            self.last = np.zeros(b.shape[1], dtype=np.float64)
+        return b

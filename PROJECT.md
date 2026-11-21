@@ -44,7 +44,9 @@ DC 阻断 → K 计权 → 滑动 LUFS 测量          ← dsp.py / loudness.py
 RAW 模式播放 → 真实耳机 / 扬声器            ← wasapi_raw.RawPlayer
 ```
 
-延迟：端到端约 **80 ms**（采集块 + 队列余量 ≤1 块 + 设备缓冲），可在界面调。
+延迟：端到端约 **53 ms**（采集 1 块 + 队列 1 块 + 设备缓冲，默认 15ms 块；10ms 可到 38ms）。
+低延迟不咔哒靠三件事：音频线程提到 TIME_CRITICAL、timeBeginPeriod(1) 定时精度、
+以及 `dsp.ClickGuard` 在块边界做 2ms 交叉淡化（欠载/丢块都不产生阶跃）。
 
 ---
 
