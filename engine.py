@@ -81,6 +81,74 @@ def restore_timer_resolution():
     except Exception:
         pass
 
+
+def open_recorder(mic, samplerate, channels, blocksize):
+    """打开 soundcard 回环采集，并给采集器打两个补丁，专治「静音时白烧 CPU」。
+
+    soundcard 的 `_record_chunk` 在设备暂时没有数据时会：
+        while 可用帧数 == 0:
+            deviceperiod()          # 每次都查 WASAPI（COM 调用，贵）
+            sleep(最小周期/4 ≈ 2.5ms)
+    静音/无播放时这段就是每 2.5ms 两次 COM 轮询，实测一个线程吃掉 11% CPU。
+    补丁：
+      1) 缓存 deviceperiod（省掉一半 COM 调用）；
+      2) 空闲越久 sleep 间隔越大（最多 8 倍），一旦有数据立刻恢复原节奏。
+    最坏情况只是「静音→有声」多等约 20ms，听不出来。
+    """
+    rec = mic.recorder(samplerate=samplerate, channels=channels,
+                       blocksize=blocksize).__enter__()
+    try:
+        import soundcard.mediafoundation as _mf
+        import numpy as _np
+
+        class _IdleFriendlyRecorder(_mf._Recorder):
+            _dp_cache = None
+            _idle_spin = 0
+
+            @property
+            def deviceperiod(self):
+                dp = self.__dict__.get("_dp_cache")
+                if dp is None:
+                    dp = _mf._Recorder.deviceperiod.fget(self)
+                    self.__dict__["_dp_cache"] = dp
+                return dp
+
+            def _record_chunk(self):
+                spin = 0
+                while self._capture_available_frames() == 0:
+                    if self._idle_start_time is None:
+                        self._idle_start_time = time.perf_counter_ns()
+                    dflt, minbl = self.deviceperiod
+                    # 1→8 倍退避：前期保持灵敏，久等才逐步降频
+                    scale = min(8, 1 + spin // 2)
+                    time.sleep(min(minbl / 4.0 * scale, 0.05))
+                    spin += 1
+                    elapsed = time.perf_counter_ns() - self._idle_start_time
+                    if elapsed / 1e9 > dflt * 4:
+                        nf = int(self.samplerate * elapsed / 1e9)
+                        nch = len(set(self.channelmap))
+                        self._idle_start_time += elapsed
+                        return _np.zeros([nf * nch], dtype="float32")
+                self._idle_start_time = None
+                data_ptr, nframes, flags = self._capture_buffer()
+                if data_ptr != _mf._ffi.NULL:
+                    chunk = _np.frombuffer(
+                        _mf._ffi.buffer(data_ptr,
+                                        nframes * 4 * len(set(self.channelmap))),
+                        dtype="float32").copy()
+                else:
+                    raise RuntimeError("Could not create capture buffer")
+                if flags & _mf._ole32.AUDCLNT_BUFFERFLAGS_SILENT:
+                    chunk[:] = 0
+                if nframes > 0:
+                    self._capture_release(nframes)
+                return chunk
+
+        rec.__class__ = _IdleFriendlyRecorder
+    except Exception:
+        pass          # soundcard 改版也不影响功能，只是 CPU 高一点
+    return rec
+
 VIRTUAL_HINTS = ("cable", "vb-audio", "voice", "虚拟", "stereo mix")
 
 
@@ -458,8 +526,7 @@ class Engine:
                             self._publish(waiting=True)
                             self._stop.wait(0.15)
                             continue
-                        rec = mic.recorder(samplerate=SR, channels=CHANNELS,
-                                           blocksize=blk).__enter__()
+                        rec = open_recorder(mic, SR, CHANNELS, blk)
                         silent_for = 0.0
                         self._publish(waiting=False)
                     d = rec.record(numframes=blk)
@@ -488,6 +555,12 @@ class Engine:
                                 continue
                     else:
                         silent_for = 0.0
+                    # 长时间静音：把采集节流到 ~20 块/秒。soundcard 每次 record 都要
+                    # 轮询 WASAPI，满速跑等于白烧一个核；有声音时 silent_for 立刻归零，
+                    # 下一块就回到正常节奏（最多多等一次 20ms，听不出）。
+                    # 阈值 2 秒：正常音乐/视频里的停顿不会误触发。
+                    if silent_for > 2.0:
+                        time.sleep(0.02)
                     while q.full():
                         try:
                             q.get_nowait()

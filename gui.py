@@ -19,7 +19,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 SIDE_W = 192
 
@@ -717,11 +717,15 @@ class AppWindow:
                     return
         except Exception:
             pass
-        try:
-            if theme.system_dark() != self.dark:
-                self.apply_theme()
-        except Exception:
-            pass
+        # 主题检查降频：读注册表每 220ms 一次没必要，2 秒足够跟手
+        now = time.time()
+        if now - getattr(self, "_last_theme_check", 0.0) > 2.0:
+            self._last_theme_check = now
+            try:
+                if theme.system_dark() != self.dark:
+                    self.apply_theme()
+            except Exception:
+                pass
         self._follow_devices()
         self._follow_config()
         self._update_live()
