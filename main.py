@@ -146,7 +146,8 @@ def control_loop(config, engine, muter, guard, stop):
         mtime = os.path.getmtime(config.path)
     except Exception:
         mtime = 0.0
-    keys = ("input_device", "output_device", "block_ms", "use_windows_volume")
+    keys = ("input_device", "output_device", "block_ms", "use_windows_volume",
+            "downmix")
     while not stop.is_set():
         try:
             # 1) 设备守护优先：换默认输出时会话枚举很慢，放后面会拖住它

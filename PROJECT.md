@@ -29,8 +29,10 @@ Windows 上不同来源（游戏、音乐、浏览器、视频）的响度差异
 各程序播放
    │  系统默认输出被守护成 CABLE 虚拟声卡
    ▼
-CABLE In 16ch（回环采集）                 ← engine.py / wasapi_raw.py
-   │  采集块 20ms（可调 10–100ms）
+CABLE In 16ch（回环采集，6/8 声道自动探测） ← engine.py / wasapi_raw.py
+   │  采集块 15ms（可调 10–100ms）
+   │  >2 声道时按 BS.775 下混：FL/FR 系数 1.0，中置/环绕 0.707，LFE 不计
+   │  （立体声内容与原样完全一致；5.1/7.1 的中置人声不会丢）
    ▼
 DC 阻断 → K 计权 → 滑动 LUFS 测量          ← dsp.py / loudness.py
    │  测量的是增益前的信号（闭环稳定）

@@ -33,6 +33,7 @@ DEFAULTS = {
     # 采集/播放块长（毫秒）。越小延迟越低，越小也越容易被别的线程抢占导致咔哒声。
     # 端到端延迟 ≈ 块长 + 队列余量(≤1块) + WASAPI 缓冲(块长+10)。
     "block_ms": 15,
+    "downmix": True,
     # 用 Windows 音量滑块（CABLE Input 那个）控制最终音量。
     # 启动时会把 CABLE 的音量设为 100%，之后滑块直接作为输出增益。
     "use_windows_volume": True,

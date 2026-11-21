@@ -30,7 +30,7 @@ from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
 from pycaw.pycaw import AudioSession, AudioUtilities  # noqa: F401
 import soundcard as sc
 
-from dsp import ClickGuard, DcBlocker
+from dsp import ClickGuard, DcBlocker, downmix_to_stereo
 from loudness import KWeighting, SlidingLUFS
 from wasapi_raw import RawPlayer
 
@@ -95,8 +95,25 @@ def open_recorder(mic, samplerate, channels, blocksize):
       2) 空闲越久 sleep 间隔越大（最多 8 倍），一旦有数据立刻恢复原节奏。
     最坏情况只是「静音→有声」多等约 20ms，听不出来。
     """
-    rec = mic.recorder(samplerate=samplerate, channels=channels,
-                       blocksize=blocksize).__enter__()
+    # 优先按更多声道打开（5.1/7.1 配置的 CABLE 才有意义），失败逐级降级，
+    # 最后一定回落到 2 声道——立体声用户的行为与以前完全一致。
+    rec = None
+    last_err = None
+    tried = []
+    for ch in (channels, 8, 6, 2):
+        if ch in tried:
+            continue
+        tried.append(ch)
+        try:
+            rec = mic.recorder(samplerate=samplerate, channels=ch,
+                               blocksize=blocksize).__enter__()
+            rec._actual_channels = ch
+            break
+        except Exception as exc:
+            last_err = exc
+            rec = None
+    if rec is None:
+        raise last_err if last_err else RuntimeError("无法打开采集设备")
     try:
         import soundcard.mediafoundation as _mf
         import numpy as _np
@@ -510,6 +527,7 @@ class Engine:
             ensure_com()
             boost_current_thread()
             rec = None
+            in_ch = CHANNELS
             silent_for = 0.0
             last_sess_check = 0.0
             sess_active = True
@@ -526,16 +544,22 @@ class Engine:
                             self._publish(waiting=True)
                             self._stop.wait(0.15)
                             continue
-                        rec = open_recorder(mic, SR, CHANNELS, blk)
+                        want_ch = 8 if cfg.get("downmix", True) else CHANNELS
+                        rec = open_recorder(mic, SR, want_ch, blk)
+                        in_ch = int(getattr(rec, "_actual_channels", CHANNELS))
+                        self._publish(in_channels=in_ch)
                         silent_for = 0.0
                         self._publish(waiting=False)
                     d = rec.record(numframes=blk)
                     if d is None or d.size == 0:
                         continue
                     try:
-                        peak = float(np.abs(d).max())
+                        peak = float(np.abs(d).max())     # 用原始声道算峰值更准
                     except Exception:
                         peak = 1.0
+                    if in_ch > 2:
+                        # 5.1/7.1 内容折成左右：中置（人声）和环绕不再丢失
+                        d = downmix_to_stereo(d)
                     if peak < 1e-6:
                         # 纯静音：可能只是真的没声音；但如果端点上明明有会话，
                         # 说明采集已经断链（老会话里开出来的采集）——重开一次

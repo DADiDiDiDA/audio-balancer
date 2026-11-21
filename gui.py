@@ -19,7 +19,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 SIDE_W = 192
 
@@ -405,8 +405,9 @@ class AppWindow:
         p.text(x + w - 24 - 54, by + 58, "启用均衡", 10, pal["sub"], anchor="e")
         p.toggle(x + w - 24 - 46, by + 54, lambda: bool(cfg.get("enabled", True)),
                  self._on_enabled)
-        desc = ("自动电平：低于范围就提上来（最多 +%.0f dB），高于范围就压下去，落在范围内不动，"
-                "声音会一直待在目标附近。" % float(cfg.get("max_boost_db", 12))
+        desc = ("自动电平：低于范围就提上来、高于范围就压下去，落在范围内不动，"
+                "让声音一直待在目标附近（最多提升 +%.0fdB）。"
+                % float(cfg.get("max_boost_db", 12))
                 if auto else
                 "仅限制：只把超过目标的部分压下来，安静的内容原样通过（不会放大底噪）。")
         p.text(x + 22, by + 94, desc, 9, pal["sub"], width=w - 44, anchor="nw")
@@ -482,9 +483,10 @@ class AppWindow:
 
         gy = vy + 174
         head, row_h, line_px = 52, 44, 23     # 23px = YaHei 10pt 的实测行高
-        list_h = int(H - gy - 8 - head - row_h)
+        list_h = int(H - gy - 8 - head - row_h - 6)
         list_h = max(line_px * 3, (list_h // line_px) * line_px)   # 整行数，避免半行被切
-        gh = head + list_h + row_h
+        # +6：输入框高 32，行高 44 时底部只剩 4px，给卡片底留点呼吸
+        gh = head + list_h + row_h + 6
         p.card(x, gy, w, gh)
         p.section(x + 22, gy + 26, "名单", "填进程名，如 StarRail.exe（不区分大小写）",
                   right=x + w - 22)
@@ -536,10 +538,10 @@ class AppWindow:
         p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
         p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
                  self._on_follow)
-        p.text(x + 22, ty + 64,
-               "在 Windows 里把默认输出换成耳机，本程序自动把它接成输出设备，"
-               "再把系统默认改回虚拟声卡 —— 下次换耳机只要在 Windows 里点一下。",
-               9, pal["sub"], width=w - 60)
+        p.text(x + 22, ty + 52,
+               "换耳机时先在系统里把默认输出点成耳机，本程序会自动接管为输出设备，"
+               "并把系统默认改回虚拟声卡——下次换耳机再点一下即可。",
+               9, pal["sub"], width=w - 48, anchor="nw")
         self.m_default = p.text(x + 22, ty + 118, "系统默认输出：—", 9, pal["dim"])
 
         vc = ty + 156
@@ -561,7 +563,7 @@ class AppWindow:
                 self._on_winvol_max, fmt=lambda v: "+%.1f dB" % v,
                 note="100% 时")
         p.text(x + 22, vc + 162,
-               "默认：滑块 20% 是正常音量，往上到 100% 逐渐增大（最多 +10 dB）。"
+               "默认：滑块 20% 是正常音量，往上到 100% 逐渐增大（最多 +10dB）。"
                "觉得整体偏大/偏小，调上面两项即可。", 9, pal["dim"], width=w - 44)
 
         by = vc + 216

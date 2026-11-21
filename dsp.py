@@ -500,3 +500,38 @@ class ClickGuard:
             b[-n:] = b[-n:] * self._down[self.n - n:]
             self.last = np.zeros(b.shape[1], dtype=np.float64)
         return b
+
+
+def downmix_to_stereo(block, assume=2):
+    """多声道按 ITU-R BS.775 下混到立体声。
+
+    为什么需要：CABLE 若在 Windows 里配成 5.1/7.1，回环采集拿到的是多声道，
+    只取前两个声道会**丢掉中置（人声）和环绕**——表现为「背景音有、人声很小」。
+
+    系数设计（关键）：
+      · 前左/前右 保持 1.0 —— 立体声内容原封不动直通，听感和不处理完全一样；
+      · 中置、后环绕、侧环绕 取 0.707（-3dB），按 BS.775 折进左右；
+      · LFE 不计（和响度测量的权重一致，避免低频过载）。
+    声道顺序按 WAVEFORMATEXTENSIBLE：FL FR FC LFE BL BR SL SR ...
+    """
+    b = np.asarray(block, dtype=np.float64)
+    if b.ndim == 1:
+        b = b[:, None]
+    n = b.shape[1]
+    if n <= 0:
+        return np.zeros((b.shape[0], 2), dtype=np.float64)
+    if n == 1:
+        return np.repeat(b, 2, axis=1)
+    L = b[:, 0].copy()
+    R = b[:, 1].copy()
+    g = 0.70710678
+    if n >= 3:                      # FC 中置 -> 左右各 -3dB
+        L += g * b[:, 2]
+        R += g * b[:, 2]
+    if n >= 6:                      # BL BR 后环绕
+        L += g * b[:, 4]
+        R += g * b[:, 5]
+    if n >= 8:                      # SL SR 侧环绕
+        L += g * b[:, 6]
+        R += g * b[:, 7]
+    return np.stack([L, R], axis=1)
