@@ -19,7 +19,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.6.3"
+VERSION = "1.7.0"
 
 SIDE_W = 192
 
@@ -27,6 +27,35 @@ NAV = [("loudness", "响度均衡"), ("mute", "自动静音"),
        ("device", "音频设备"), ("about", "关于")]
 
 METER_LO, METER_HI = -45.0, -5.0
+
+# 音量均衡预设：一次把「目标 + 范围 + 上限 + 跟随快慢」整套设好。
+# 顺序即界面顺序；None = 自定义（不写入任何值，只用来显示状态）。
+# 判定逻辑：配置里的每一项都和某组预设一致，才算选中该预设，否则显示「自定义」。
+LOUD_PRESETS = [
+    ("自定义", None,
+     "当前是手动设置，下面各项自己调。"),
+    ("人声", {"enabled": True, "level_mode": "auto",
+              "target_lufs": -16.0, "target_range_db": 3.0,
+              "max_boost_db": 15.0, "max_attenuation_db": 20.0,
+              "gain_attack_ms": 60, "gain_release_ms": 500},
+     "人声 / 播客：跟得快，小声说话也听得清（目标 −16 LUFS）。"),
+    ("均衡", {"enabled": True, "level_mode": "auto",
+              "target_lufs": -18.0, "target_range_db": 3.0,
+              "max_boost_db": 12.0, "max_attenuation_db": 20.0,
+              "gain_attack_ms": 120, "gain_release_ms": 900},
+     "均衡：音乐 / 视频通用，动得不多，听起来最自然（目标 −18 LUFS）。"),
+    ("电影", {"enabled": True, "level_mode": "auto",
+              "target_lufs": -20.0, "target_range_db": 4.0,
+              "max_boost_db": 10.0, "max_attenuation_db": 24.0,
+              "gain_attack_ms": 150, "gain_release_ms": 1500},
+     "电影 / 剧集：保住大动态，只收一收过响的部分（目标 −20 LUFS）。"),
+    ("夜间", {"enabled": True, "level_mode": "auto",
+              "target_lufs": -23.0, "target_range_db": 2.0,
+              "max_boost_db": 18.0, "max_attenuation_db": 30.0,
+              "gain_attack_ms": 40, "gain_release_ms": 300},
+     "夜间 / 游戏：把动态压扁，音量不大也什么都听得见（目标 −23 LUFS）。"),
+]
+
 
 
 def _fmt_db(v):
@@ -60,6 +89,8 @@ class AppWindow:
         self._resize_job = None
         self._last_size = (0, 0)
         self._btn_save = None
+        self._tip_text = None      # 当前悬停的说明文字
+        self._tip_ids = []         # 气泡的 canvas item（重建页面时清掉）
         self.meter = None
         self.m_band = None
         self._glass_raw = None
@@ -146,6 +177,7 @@ class AppWindow:
         c.bind("<B1-Motion>", self._drag)
         c.bind("<ButtonRelease-1>", self._release)
         c.bind("<Motion>", self._motion)
+        c.bind("<Leave>", lambda e: self._hide_tip())
         c.bind("<Configure>", self._on_resize)
         s = self.side
         s.bind("<Button-1>", self._side_press)
@@ -189,6 +221,53 @@ class AppWindow:
                 self.body.configure(cursor=cur)
             except Exception:
                 pass
+        tip = (hit or {}).get("tip")
+        if tip != self._tip_text:
+            if tip:
+                self._show_tip(tip, hit.get("box"))
+            else:
+                self._hide_tip()
+
+    # ---------------------------------------------------------------- 说明气泡
+    def _show_tip(self, text, box=None):
+        """在图标下方画说明气泡（纯 canvas 图元，画在最上层，不参与点击）。"""
+        self._hide_tip()
+        cv = self.body
+        # 先用一条屏外文本量出自动换行后的真实尺寸
+        tmp = cv.create_text(-4000, -4000, text=text, font=(FONT, 9),
+                             width=250, anchor="nw", fill=self.pal["text"])
+        bb = cv.bbox(tmp)
+        cv.delete(tmp)
+        if not bb:
+            return
+        tw, th = max(60, bb[2] - bb[0]), max(16, bb[3] - bb[1])
+        bw, bh = tw + 24, th + 14
+        W = max(cv.winfo_width(), 640)
+        H = max(cv.winfo_height(), 520)
+        if box:
+            ax = (box[0] + box[2]) / 2.0 - bw / 2.0
+            ay = box[3] + 9
+        else:
+            ax, ay = 40.0, 40.0
+        ax = min(max(8.0, ax), W - bw - 8.0)
+        if ay + bh > H - 10:                    # 下面放不下就翻到图标上方
+            ay = (box[1] - bh - 9) if box else max(8.0, ay - bh - 20)
+        ay = max(8.0, ay)
+        bg = ui_kit.shape(cv, ax, ay, bw, bh, 8,
+                          fill=self.pal["card2"], outline=self.pal["line"])
+        tx = cv.create_text(ax + 12, ay + 7, text=text, font=(FONT, 9),
+                            width=250, anchor="nw", fill=self.pal["text"])
+        self._tip_ids = [i for i in (bg, tx) if i is not None]
+        self._tip_text = text
+
+    def _hide_tip(self):
+        for i in self._tip_ids:
+            try:
+                self.body.delete(i)
+            except Exception:
+                pass
+        self._tip_ids = []
+        self._tip_text = None
 
     def _side_press(self, ev):
         hit = self._hit_at(self._side_hits, ev.x, ev.y)
@@ -292,6 +371,8 @@ class AppWindow:
         self._hover = None
         self._active = None
         self._btn_save = None
+        self._tip_ids = []          # delete("all") 已经连带删掉气泡
+        self._tip_text = None
 
         W = max(self.body.winfo_width(), 640)
         H = max(self.body.winfo_height(), 520)
@@ -396,13 +477,28 @@ class AppWindow:
         p.text(mx0, my + 22, "−45", 8, pal["dim"])
         p.text(mx1, my + 22, "−5", 8, pal["dim"], anchor="e")
 
+        # --- 音量均衡预设 ---
+        py = cy + 116
+        p.card(x, py, w, 94)
+        p.section(x + 22, py + 24, "音量均衡预设",
+                  tip="一次设好目标响度、范围、上限和跟随快慢；"
+                      "之后手动微调会变成「自定义」。")
+        idx = self._preset_index()
+        p.segment(x + 22, py + 38, w - 44, 30,
+                  [n for n, _s, _d in LOUD_PRESETS], idx, self._on_preset)
+        p.text(x + 22, py + 80, LOUD_PRESETS[idx][2], 9, pal["sub"], width=w - 44)
+
         # --- 处理方式 ---
-        by = cy + 116
+        by = py + 106
         p.card(x, by, w, 214)
-        p.section(x + 22, by + 26, "处理方式")
+        p.section(x + 22, by + 26, "处理方式",
+                  tip="自动电平：低于目标就提、高于目标就压，让声音一直待在目标附近；"
+                      "仅限制：只压过响的部分，安静内容原样通过（不放大底噪）。")
         p.segment(x + 22, by + 50, 236, 34, ["仅限制", "自动电平"],
                   1 if auto else 0, self._on_mode)
-        p.text(x + w - 24 - 54, by + 58, "启用均衡", 10, pal["sub"], anchor="e")
+        p.text(x + w - 96, by + 58, "启用均衡", 10, pal["sub"], anchor="e")
+        p.help(x + w - 84, by + 58,
+               "关掉后不做任何电平调整，只按音量/直通处理；自动静音不受影响。")
         p.toggle(x + w - 24 - 46, by + 54, lambda: bool(cfg.get("enabled", True)),
                  self._on_enabled)
         desc = ("自动电平：低于范围就提上来、高于范围就压下去，落在范围内不动，"
@@ -414,29 +510,36 @@ class AppWindow:
 
         col = (w - 44 - 26) / 2.0
         p.field(x + 22, by + 150, col, "目标响度", float(cfg.get("target_lufs", -18)),
-                -30, -8, 0.5, self._on_target, fmt=lambda v: "%.1f LUFS" % v)
+                -30, -8, 0.5, self._on_target, fmt=lambda v: "%.1f LUFS" % v,
+                tip="希望听到的平均响度。−18 LUFS ≈ 常见视频的正常音量；数字越小越响。")
         p.field(x + 22 + col + 26, by + 150, col, "目标范围 ±",
                 float(cfg.get("target_range_db", 3)), 0, 8, 0.5, self._on_range,
                 fmt=lambda v: "±%.1f dB" % v, disabled=not auto,
-                note="" if auto else "仅自动电平")
+                note="" if auto else "仅自动电平",
+                tip="允许的偏差带。落在目标附近这个范围内就不动手，避免一直微调导致的「呼吸感」。")
 
         # --- 限制与余量 ---
         ly = by + 226
         p.card(x, ly, w, 186)
-        p.section(x + 22, ly + 26, "限制与余量")
+        p.section(x + 22, ly + 26, "限制与余量",
+                  tip="这几项是安全边界：决定最多能提升/衰减多少，以及输出峰值的天花板。")
         p.field(x + 22, ly + 52, col, "最大衰减",
                 float(cfg.get("max_attenuation_db", 20)), 0, 36, 1,
-                self._on_maxatt, fmt=lambda v: "−%.0f dB" % v)
+                self._on_maxatt, fmt=lambda v: "−%.0f dB" % v,
+                tip="最多把响的部分压下去多少 dB。小一点更保动态，大一点更平。")
         p.field(x + 22 + col + 26, ly + 52, col, "最大提升",
                 float(cfg.get("max_boost_db", 12)), 0, 24, 1,
                 self._on_maxboost, fmt=lambda v: "+%.0f dB" % v,
-                disabled=not auto, note="" if auto else "仅自动电平")
+                disabled=not auto, note="" if auto else "仅自动电平",
+                tip="最多把安静的部分提上来多少 dB。提得越多，底噪也一起被放大。")
         p.field(x + 22, ly + 108, col, "限幅上限",
                 float(cfg.get("limiter_ceiling_db", -1)), -6, 0, 0.5,
-                self._on_ceiling, fmt=lambda v: "%.1f dBFS" % v)
+                self._on_ceiling, fmt=lambda v: "%.1f dBFS" % v,
+                tip="输出的绝对上限。0 是数字满刻度，留 −1 dB 给重采样/编码的余量。")
         p.field(x + 22 + col + 26, ly + 108, col, "处理前降低",
                 float(cfg.get("pre_gain_db", 0)), -24, 0, 1,
-                self._on_pre, fmt=lambda v: "%+.0f dB" % v)
+                self._on_pre, fmt=lambda v: "%+.0f dB" % v,
+                tip="整体先降这么多再处理：等于把音量基准放低，同时给限幅器留更多余量。")
         p.text(x + 22, ly + 162, "直通：完全不做处理，只把声音原样送到耳机", 9, pal["sub"])
         p.toggle(x + w - 24 - 46, ly + 154,
                  lambda: bool(cfg.get("passthrough", False)), self._on_passthrough)
@@ -450,6 +553,8 @@ class AppWindow:
         cy = y + 62
         p.card(x, cy, w, 62)
         p.text(x + 22, cy + 22, "启用自动静音", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("启用自动静音", 11, True) + 12, cy + 22,
+               "总开关。关掉后立刻恢复所有程序的原音量，不再自动静音。")
         p.text(x + 22, cy + 43, "关掉后立刻恢复所有程序的原音量", 9, pal["sub"])
         p.toggle(x + w - 24 - 46, cy + 18, lambda: bool(cfg.get("mute_enabled", True)),
                  self._on_mute)
@@ -458,11 +563,16 @@ class AppWindow:
         p.card(x, ry, w, 146)
         p.section(x + 22, ry + 24, "规则", "两条规则各自独立，只认名单里的程序", right=x + w - 22)
         p.text(x + 22, ry + 54, "挂机静音", 10)
+        p.help(x + 22 + ui_kit.text_width("挂机静音", 10) + 12, ry + 54,
+               "名单里的程序切到后台（最小化/挂机）就只把它自己静音，其它程序不受影响。")
         p.text(x + 22, ry + 74, "名单里的程序切到后台（最小化 / 挂机）就把它自己静音", 9, pal["sub"])
         p.toggle(x + w - 24 - 46, ry + 48,
                  lambda: bool(cfg.get("mute_listed_in_background", True)), self._on_mute_bg)
         p.divider(x + 22, ry + 94, w - 44)
         p.text(x + 22, ry + 112, "游戏时压制其它程序", 10)
+        p.help(x + 22 + ui_kit.text_width("游戏时压制其它程序", 10) + 12, ry + 112,
+               "名单里的程序在前台时，把其它程序的音量压到下面「压到」的值，"
+               "用来突出游戏/会议的声音。")
         p.text(x + 22, ry + 132, "名单里的程序在前台时，把其它程序压到「压到」的值", 9, pal["sub"])
         p.toggle(x + w - 24 - 46, ry + 106,
                  lambda: bool(cfg.get("mute_others_in_game", False)), self._on_mute_others)
@@ -473,13 +583,16 @@ class AppWindow:
         col = (w - 44 - 26) / 2.0
         p.field(x + 22, vy + 52, col, "名单程序在前台时",
                 float(cfg.get("mute_fg_volume", 1.0)), 0, 1, 0.05,
-                self._on_fg, fmt=lambda v: "%.0f%%" % (v * 100))
+                self._on_fg, fmt=lambda v: "%.0f%%" % (v * 100),
+                tip="名单里的程序自己在前台时的音量，一般保持 100%。")
         p.field(x + 22 + col + 26, vy + 52, col, "压到",
                 float(cfg.get("mute_bg_volume", 0.0)), 0, 1, 0.05,
-                self._on_bg, fmt=lambda v: "%.0f%%" % (v * 100))
+                self._on_bg, fmt=lambda v: "%.0f%%" % (v * 100),
+                tip="别的程序被压到多少音量。0% 就是完全静音，想还能听见点就用 10~20%。")
         p.field(x + 22, vy + 110, col, "渐变时长",
                 float(cfg.get("mute_easing_ms", 300)), 100, 2000, 50,
-                self._on_easing, fmt=lambda v: "%.0f ms" % v)
+                self._on_easing, fmt=lambda v: "%.0f ms" % v,
+                tip="音量变化的过渡时间。太短会有突兀的「啪」，太长会显得反应迟钝。")
 
         gy = vy + 174
         head, row_h, line_px = 52, 44, 23     # 23px = YaHei 10pt 的实测行高
@@ -489,7 +602,8 @@ class AppWindow:
         gh = head + list_h + row_h + 6
         p.card(x, gy, w, gh)
         p.section(x + 22, gy + 26, "名单", "填进程名，如 StarRail.exe（不区分大小写）",
-                  right=x + w - 22)
+                  right=x + w - 22,
+                  tip="只认这里的程序。进程名看任务管理器「详细信息」里的名称，不区分大小写。")
         lb = p.listbox(x + 24, gy + head, w - 48, list_h)
         for g in (cfg.get("mute_games", []) or []):
             lb.insert("end", g)
@@ -511,6 +625,8 @@ class AppWindow:
         p.section(x + 22, cy + 24, "设备", "改完立即重连（约 0.2 秒静音）", right=x + w - 22)
 
         p.text(x + 22, cy + 68, "监听输入", 10, pal["sub"])
+        p.help(x + 22 + ui_kit.text_width("监听输入", 10) + 12, cy + 68,
+               "从哪里采集声音。一般是 CABLE：系统默认输出指向它，所有程序的声音都会经过它。")
         cb1 = ttk.Combobox(p.cv, textvariable=self.var_input,
                            values=[""] + self._inputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
@@ -519,6 +635,8 @@ class AppWindow:
                            width=w - 176, height=30)
 
         p.text(x + 22, cy + 122, "输出设备", 10, pal["sub"])
+        p.help(x + 22 + ui_kit.text_width("输出设备", 10) + 12, cy + 122,
+               "处理完送到哪个设备，通常是你的耳机/音箱。")
         cb2 = ttk.Combobox(p.cv, textvariable=self.var_output,
                            values=[""] + self._outputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
@@ -528,7 +646,8 @@ class AppWindow:
 
         blk = float(cfg.get("block_ms", 15))
         p.field(x + 22, cy + 164, w - 44, "缓冲（越小延迟越低；10ms 已很稳）",
-                blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v)
+                blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v,
+                tip="每块处理的时长：越小延迟越低，但越依赖设备缓冲去挡线程抖动。11–15 ms 兼顾跟手和稳定。")
         p.text(x + 22, cy + 212,
                "当前端到端延迟约 %.0f ms（采集/队列 2 块 + 设备缓冲）"
                % (blk * 2 + max(24, blk * 2 + 6)),
@@ -537,6 +656,9 @@ class AppWindow:
         ty = cy + 244
         p.card(x, ty, w, 144)
         p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("自动接管系统默认输出", 11, True) + 12, ty + 26,
+               "你在系统里把默认输出点到耳机时，本程序自动把耳机设为输出设备，"
+               "再把系统默认改回虚拟声卡——声音不断，下次换耳机再点一下就行。")
         p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
                  self._on_follow)
         p.text(x + 22, ty + 52,
@@ -548,6 +670,9 @@ class AppWindow:
         vc = ty + 156
         p.card(x, vc, w, 204)
         p.text(x + 22, vc + 26, "用 Windows 音量滑块控制声音大小", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("用 Windows 音量滑块控制声音大小", 11, True) + 12,
+               vc + 26,
+               "引擎只读系统音量滑块的值当输出增益，绝不修改你的滑块。关掉则完全按内部增益输出。")
         p.text(x + 22, vc + 50,
                "系统音量里「CABLE In 16ch」的滑块即为最终音量，引擎主动读它当输出增益。",
                9, pal["sub"], width=w - 60)
@@ -558,11 +683,13 @@ class AppWindow:
         p.field(x + 22, vc + 78, col, "正常音量位置",
                 float(cfg.get("winvol_ref", 0.20)) * 100, 5, 60, 1,
                 self._on_winvol_ref, fmt=lambda v: "%.0f%%" % v,
-                note="此处=标准音量")
+                note="此处=标准音量",
+                tip="滑块停在这个位置时输出 0 dB（标准音量）。习惯把音量拉得很低的话，把它调小。")
         p.field(x + 22 + col + 26, vc + 78, col, "最大增益",
                 float(cfg.get("winvol_max_db", 10.0)), 0, 20, 0.5,
                 self._on_winvol_max, fmt=lambda v: "+%.1f dB" % v,
-                note="100% 时")
+                note="100% 时",
+                tip="滑块拉到 100% 时额外增加多少 dB。加太多会让软限幅一直在工作，听感发毛。")
         p.text(x + 22, vc + 162,
                "默认：滑块 20% 是正常音量，往上到 100% 逐渐增大（最多 +10dB）。"
                "觉得整体偏大/偏小，调上面两项即可。", 9, pal["dim"], width=w - 44)
@@ -599,6 +726,8 @@ class AppWindow:
 
         p.card(x, cy + 270, w, 188)
         p.text(x + 24, cy + 292, "开机自启", 11, bold=True)
+        p.help(x + 24 + ui_kit.text_width("开机自启", 11, True) + 12, cy + 292,
+               "登录 Windows 时静默启动核心：托盘常驻、不弹界面，声音处理立刻可用。")
         p.text(x + 24, cy + 316,
                "开机时静默启动核心（托盘常驻、不弹界面），声音处理立即就绪。",
                9, pal["sub"], width=w - 96, anchor="nw")
@@ -768,6 +897,41 @@ class AppWindow:
     def _set(self, key, value):
         self.config.set(key, value)
         self._mark_change()
+
+    # ---- 音量均衡预设 ----
+    def _preset_index(self):
+        """配置和哪一组预设完全一致就返回它的下标，否则 0（自定义）。"""
+        cfg = self.config
+        for i, (_name, spec, _desc) in enumerate(LOUD_PRESETS):
+            if not spec:
+                continue
+            ok = True
+            for k, want in spec.items():
+                cur = cfg.get(k, None)
+                if isinstance(want, bool):
+                    ok = bool(cur) == want
+                elif isinstance(want, str):
+                    ok = str(cur) == want
+                else:
+                    try:
+                        ok = abs(float(cur) - float(want)) <= 1e-6
+                    except (TypeError, ValueError):
+                        ok = False
+                if not ok:
+                    break
+            if ok:
+                return i
+        return 0
+
+    def _on_preset(self, i):
+        spec = LOUD_PRESETS[i][1]
+        if spec:
+            for k, v in spec.items():
+                self.config.set(k, v)
+            self._mark_change()
+        # 「自定义」不写任何值；无论如何都重绘一次，让高亮回到真实状态
+        # （否则点了「自定义」会停在自定义上，但参数还是原来那组）
+        self.root.after(10, self.render)
 
     def _on_enabled(self, v):
         self._set("enabled", bool(v))

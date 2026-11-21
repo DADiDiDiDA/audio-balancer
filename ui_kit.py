@@ -53,6 +53,23 @@ def shape(cv, x, y, w, h, r=0, fill=None, outline=None, ow=1.0):
                            image=photo(w, h, r, fill, outline, ow), anchor="nw")
 
 
+_width_cache = {}
+
+
+def text_width(s, size=10, bold=False):
+    """量一段文字的像素宽度（排「标签 + 小图标」时要用）。"""
+    key = (s, size, bold)
+    v = _width_cache.get(key)
+    if v is None:
+        try:
+            from tkinter import font as tkfont
+            v = tkfont.Font(font=(FONT, size, "bold") if bold else (FONT, size)).measure(s)
+        except Exception:
+            v = len(s) * size
+        _width_cache[key] = v
+    return v
+
+
 # ---------------------------------------------------------------- 控件
 class Toggle:
     """开关：0/1，120ms 滑动动画。"""
@@ -304,8 +321,10 @@ class Painter:
         return shape(self.cv, x, y, w, h, r,
                      fill=fill or self.pal["card"], outline=outline or self.pal["line"])
 
-    def section(self, x, y, title, note=None, right=None):
+    def section(self, x, y, title, note=None, right=None, tip=None):
         self.text(x, y, title, 11, bold=True)
+        if tip:
+            self.help(x + text_width(title, 11, True) + 12, y, tip)
         if note:
             if right:
                 self.text(right, y, note, 9, self.pal["dim"], anchor="e")
@@ -314,6 +333,20 @@ class Painter:
 
     def divider(self, x, y, w):
         return self.cv.create_line(x, y, x + w, y, fill=self.pal["line"])
+
+    def help(self, x, y, text, r=7.0):
+        """一个「!」小圆点：鼠标移上去由窗口画说明气泡。
+
+        画在这里而不是用 ttk 的 ToolTip，是因为整页都是 Canvas 自绘，
+        只有把热点一起注册进 hits，命中判定才和视觉一致。
+        """
+        pal = self.pal
+        shape(self.cv, x - r, y - r, r * 2, r * 2, r,
+              fill=pal["card2"], outline=pal["line"])
+        self.cv.create_text(x, y + 0.5, text="!", font=(FONT, 8, "bold"),
+                            fill=pal["sub"])
+        self.hits.append({"box": (x - r - 2, y - r - 2, x + r + 2, y + r + 2),
+                          "tip": text, "cursor": ""})
 
     # ---- 控件 ----
     def toggle(self, x, y, get, on_toggle, w=46, h=26):
@@ -339,10 +372,12 @@ class Painter:
         return b
 
     def field(self, x, y, w, label, value, lo, hi, step, on_change,
-              fmt=None, note=None, disabled=False):
+              fmt=None, note=None, disabled=False, tip=None):
         """一行字段：标题一行、滑块一行、数值靠右。返回 (滑块, 数值文本 item)。"""
         fmt = fmt or (lambda v: "%g" % v)
         self.text(x, y, label, 10, self.pal["dim"] if disabled else self.pal["sub"])
+        if tip:
+            self.help(x + text_width(label, 10) + 12, y, tip)
         if note:
             self.text(x + w, y, note, 9, self.pal["dim"], anchor="e")
         # 数值文字最宽约 80px（如 "-17.5 LUFS" / "-1.0 dBFS"），
