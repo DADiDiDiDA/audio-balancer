@@ -98,6 +98,7 @@ class Config:
         self.saved_at = 0.0
         self._data = copy.deepcopy(DEFAULTS)
         self._lock = threading.RLock()
+        self._version = 0
         self._timer = None
         self._dirty = False
         self._delay = float(autosave_delay)
@@ -113,6 +114,8 @@ class Config:
                 for k, v in data.items():
                     if k in DEFAULTS:
                         self._data[k] = v
+            with self._lock:
+                self._version += 1
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -151,16 +154,34 @@ class Config:
         """改一项：内存立即生效，磁盘写入合并到 0.4 秒后。"""
         with self._lock:
             self._data[key] = value
+            self._version += 1
         self._touch()
 
     def update(self, patch):
         with self._lock:
             self._data.update(patch)
+            self._version += 1
         self._touch()
 
     def snapshot(self):
         with self._lock:
             return copy.deepcopy(self._data)
+
+    def version(self):
+        """配置版本号：热路径（音频每块）用它判断要不要重新取一次配置。
+
+        每块都 deepcopy 一份配置在 100 块/秒时是纯粹的浪费；版本号没变就直接复用。
+        """
+        with self._lock:
+            return self._version
+
+    def view(self):
+        """浅拷贝快照，给热路径用（比 deepcopy 便宜一个数量级）。
+
+        引擎只读、不改里面的值；列表类配置（名单）它也不碰，浅拷贝足够安全。
+        """
+        with self._lock:
+            return dict(self._data)
 
     # ---------- 自动保存 ----------
     def _touch(self):

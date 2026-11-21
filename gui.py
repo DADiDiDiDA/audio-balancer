@@ -14,12 +14,13 @@ from tkinter import ttk
 from PIL import Image, ImageFilter, ImageGrab, ImageTk
 
 import autostart
+import ipc
 import theme
 import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 SIDE_W = 192
 
@@ -427,10 +428,10 @@ class AppWindow:
         running = bool(st.get("running"))
         err = st.get("error")
         paused = st.get("paused")
-        if paused == "rdp":
-            color, label = pal["warn"], "远程桌面 · 已暂停"
-        elif err:
+        if err:
             color, label = pal["err"], "链路中断"
+        elif paused == "rdp":
+            color, label = pal["warn"], "远程桌面 · 已暂停"
         elif not running:
             color, label = pal["err"], "未运行"
         else:
@@ -1097,8 +1098,21 @@ class AppWindow:
             self._inputs, self._outputs = [], []
 
     def _rescan_click(self):
+        # 真正让核心重新枚举一次设备（状态文件里的列表平时 15 秒才更新一次），
+        # 界面这边只是等它刷新后把下拉框重建出来
+        try:
+            ipc.set_event(ipc.EV_RESCAN)
+        except Exception:
+            pass
         self._rescan()
         self.render()
+        self.root.after(450, self._rescan_again)
+
+    def _rescan_again(self):
+        before = (list(self._inputs), list(self._outputs))
+        self._rescan()
+        if (list(self._inputs), list(self._outputs)) != before:
+            self.render()
 
     def _apply_device(self):
         self.config.update({

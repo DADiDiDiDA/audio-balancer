@@ -89,7 +89,6 @@ def boom2(*a, **k):
     raise RuntimeError("假设备")
 eng2._pick_input = boom2
 eng2._pick_output = boom2
-eng2._rdp_blocked = lambda c: session.blocked(bool(c.get("rdp_takeover", False)))
 eng2.start()
 time.sleep(0.5)
 check("先行运行（blocked=False）会尝试建链", opened["n"] > 0, opened["n"])

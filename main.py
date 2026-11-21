@@ -23,10 +23,16 @@ from engine import Engine
 from muter import Muter, ensure_com
 
 LOG_PATH = os.path.join(app_dir(), "音频均衡器.log")
+LOG_MAX = 1024 * 1024      # 超过 1MB 就轮转成 .log.1（常驻几天能涨到几 MB）
 
 
 def log(msg):
     try:
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX:
+                os.replace(LOG_PATH, LOG_PATH + ".1")
+        except OSError:
+            pass            # 文件不存在 / 正被占用：照常追加就行
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
@@ -140,13 +146,16 @@ def set_phase(name):
     PHASE["since"] = time.time()
 
 
-def control_loop(config, engine, muter, guard, stop):
+def control_loop(config, engine, muter, guard, stop, icon=None):
     """调度自动静音 + 设备守护；顺带写状态文件、监视配置、监控引擎异常。"""
     ensure_com()
     last_err = None
     last_guard = 0.0
     last_status = 0.0
     last_devices = 0.0
+    last_payload = None
+    last_write = 0.0
+    last_paused = None
     rdp_restored = False
     devices = {"inputs": [], "outputs": []}
     try:
@@ -155,6 +164,10 @@ def control_loop(config, engine, muter, guard, stop):
         mtime = 0.0
     keys = ("input_device", "output_device", "block_ms", "use_windows_volume",
             "downmix", "rdp_takeover")
+    rescan_evt = ipc.create_event(ipc.EV_RESCAN)     # 界面点「重新扫描」用
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    k32.WaitForSingleObject.restype = ctypes.c_uint
     while not stop.is_set():
         try:
             # 1) 设备守护优先：换默认输出时会话枚举很慢，放后面会拖住它
@@ -206,10 +219,13 @@ def control_loop(config, engine, muter, guard, stop):
 
             # 3) 设备列表给 UI 用（UI 进程不再自己初始化音频 COM）
             now = time.time()
-            if now - last_devices > 10.0:
+            if rescan_evt and k32.WaitForSingleObject(rescan_evt, 0) == 0:
+                last_devices = 0.0           # 界面要求立刻重扫
+            if now - last_devices > 15.0:
                 last_devices = now
-                devices = {"inputs": engine.list_inputs(),
-                           "outputs": engine.list_outputs()}
+                ins, outs = engine.list_devices()      # 一次枚举，别枚举两遍
+                if ins != devices["inputs"] or outs != devices["outputs"]:
+                    devices = {"inputs": ins, "outputs": outs}
 
             # 4) 状态文件：UI 进程只读它
             if now - last_status >= 0.2:
@@ -222,9 +238,23 @@ def control_loop(config, engine, muter, guard, stop):
                     "controlled": int(muter.controlled or 0),
                     "muted": list(muter.muted or []),
                     "guard": guard.status() if guard else {},
-                    "ts": time.time(),
                 })
-                ipc.write_status(st)
+                # 内容没变就别写盘：静音时每秒 5 次「建临时文件 + 原子替换」纯属
+                # 折腾磁盘。最长 1 秒兜底写一次，界面判活（>6s 认为核心没了）依旧安全。
+                if st != last_payload or now - last_write >= 1.0:
+                    last_payload = dict(st)
+                    last_write = now
+                    st["ts"] = now
+                    ipc.write_status(st)
+                # 托盘提示跟着「远程桌面未接管」状态变，鼠标停上去就能看出来
+                paused = st.get("paused")
+                if icon is not None and paused != last_paused:
+                    last_paused = paused
+                    try:
+                        icon.title = ("音频均衡器 · 远程桌面未接管"
+                                      if paused == "rdp" else "音频均衡器")
+                    except Exception:
+                        pass
         except Exception:
             log("控制循环异常：\n" + traceback.format_exc())
         stop.wait(0.3)
@@ -281,7 +311,7 @@ def main():
         threading.Thread(target=icon.run, daemon=True).start()
     threading.Thread(target=watch_show_event, args=(stop,), daemon=True).start()
     threading.Thread(target=control_loop,
-                     args=(config, engine, muter, guard, stop), daemon=True).start()
+                     args=(config, engine, muter, guard, stop, icon), daemon=True).start()
     threading.Thread(target=watchdog, args=(guard, stop), daemon=True).start()
 
     ensure_com()

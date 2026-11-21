@@ -24,6 +24,8 @@ MUTEX_UI = NS + "AudioBalancer_UI_v2"
 EV_SHOW_UI = NS + "AudioBalancer_ShowUI_v2"
 EV_UI_SHOW = NS + "AudioBalancer_UIShow_v2"
 EV_UI_QUIT = NS + "AudioBalancer_UIQuit_v2"
+# 界面点「重新扫描」→ 让核心立刻重新枚举一次音频设备（否则最多要等 15 秒）
+EV_RESCAN = NS + "AudioBalancer_Rescan_v2"
 
 ERROR_ALREADY_EXISTS = 183
 ERROR_ACCESS_DENIED = 5

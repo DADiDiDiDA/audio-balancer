@@ -18,6 +18,7 @@ import ctypes
 import time
 from ctypes import POINTER, Structure, byref, c_int, c_int64, c_uint32, c_void_p
 
+import numpy as np
 from comtypes import COMMETHOD, CLSCTX_ALL, GUID, HRESULT, IUnknown
 
 AUDCLNT_SHAREMODE_SHARED = 0
@@ -163,7 +164,6 @@ class RawPlayer:
         """写入一帧数组 (frames, channels) float32；阻塞直到全部写进缓冲。"""
         if self._client is None:
             raise RuntimeError("播放器未打开")
-        import numpy as np
         arr = np.ascontiguousarray(data, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr[:, None]
@@ -183,15 +183,28 @@ class RawPlayer:
         while pos < frames:
             pad = int(self._client.GetCurrentPadding())
             avail = self._bufsize - pad
-            if avail <= 0:
+            left = frames - pos
+            if avail < left and left <= self._bufsize:
+                # 缓冲还没腾出「一整块」的空间：一次睡够，别 3ms 醒一次。
+                # 每次 sleep 本身约 40µs CPU（线程切换），26ms 缓冲 + 10ms 块
+                # 的情况下原来要醒 3~4 次，光这一项就吃掉 1% 以上 CPU。
+                # 只在缓冲满（会欠载的反面）时才会走到这里，睡多久都不会丢音。
                 if time.time() > deadline:
                     return          # 别死等，丢这一块也比卡死强
+                need = left - max(avail, 0)
+                time.sleep(min(max(need / float(self.samplerate), 0.001), 0.02))
+                continue
+            if avail <= 0:
+                if time.time() > deadline:
+                    return
                 time.sleep(0.003)
                 continue
-            take = min(avail, frames - pos)
+            take = min(avail, left)
             dest = self._render.GetBuffer(take)
             chunk = arr[pos:pos + take]
-            ctypes.memmove(dest, chunk.tobytes(), take * self.channels * 4)
+            # 直接拿 numpy 的裸指针 memmove：原来 chunk.tobytes() 每次都多分配
+            # 一份 ~4KB 的字节串，100 块/秒就是纯垃圾
+            ctypes.memmove(dest, chunk.ctypes.data, take * self.channels * 4)
             self._render.ReleaseBuffer(take, 0)
             pos += take
             deadline = time.time() + 5.0

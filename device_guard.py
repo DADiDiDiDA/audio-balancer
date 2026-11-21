@@ -103,13 +103,52 @@ def set_default_render(device_id):
         return False
 
 
+_default_cache = {"id": None, "name": ""}
+
+
+def default_render():
+    """默认渲染（多媒体角色）端点的 IMMDevice 指针。
+
+    比 `AudioUtilities.GetSpeakers()` 便宜得多：不激活任何接口、不读属性表。
+    自动静音枚举会话时也用这个指针 Activate 会话管理器，省掉同一次 CreateDevice。
+    """
+    en = AudioUtilities.GetDeviceEnumerator()
+    return en.GetDefaultAudioEndpoint(0, 1)     # eRender, eMultimedia
+
+
 def current_default():
-    """返回 (id, 名称)；失败返回 (None, "")。"""
+    """返回 (id, 名称)；失败返回 (None, "")。
+
+    为什么不用 pycaw 的 `AudioUtilities.GetSpeakers()`：它内部会 CreateDevice，
+    把端点属性表**整表**读一遍（实测每次 ~10ms），而这函数在控制循环里 1.5 秒
+    调一次、界面刷新时还要调，白白烧 CPU。这里改成两步：
+      1) 只取默认端点的 id（便宜的 COM 调用）；
+      2) id 没变就直接用缓存的名字，只有真的换了设备才去读一次属性。
+    代价是设备被重命名后要等一次切换才更新——无所谓。
+    """
     try:
-        d = AudioUtilities.GetSpeakers()
-        return d.id, (d.FriendlyName or "")
+        ptr = default_render()
+        dev_id = ptr.GetId()
     except Exception:
-        return None, ""
+        try:
+            d = AudioUtilities.GetSpeakers()
+            return d.id, (d.FriendlyName or "")
+        except Exception:
+            return None, ""
+    if dev_id and dev_id == _default_cache["id"] and _default_cache["name"]:
+        return dev_id, _default_cache["name"]
+    name = ""
+    try:
+        name = AudioUtilities.CreateDevice(ptr).FriendlyName or ""
+    except Exception:
+        pass
+    _default_cache["id"], _default_cache["name"] = dev_id, name
+    return dev_id, name
+
+
+def is_virtual_name(name):
+    low = (name or "").lower()
+    return any(k in low for k in VIRTUAL_HINTS)
 
 
 class DeviceGuard:

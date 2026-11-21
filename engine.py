@@ -137,9 +137,17 @@ def open_recorder(mic, samplerate, channels, blocksize):
                     if self._idle_start_time is None:
                         self._idle_start_time = time.perf_counter_ns()
                     dflt, minbl = self.deviceperiod
-                    # 1→8 倍退避：前期保持灵敏，久等才逐步降频
-                    scale = min(8, 1 + spin // 2)
-                    time.sleep(min(minbl / 4.0 * scale, 0.05))
+                    if spin == 0:
+                        # 刚读完一块，下一包还在路上。按设备周期睡一次就够了：
+                        # 原来每 2.5ms 醒一次，一块要醒 4~7 次，而每次 sleep 本身
+                        # 就要 40µs 左右 CPU（线程切换），实测这一项占了空闲/播放
+                        # 时 CPU 的 2~3%。这里只在「确实没数据」时才睡，睡够了再问，
+                        # 有积压的包第一次轮询就直接拿到，不会累积延迟。
+                        time.sleep(min(max(dflt * 0.95, 0.001), 0.05))
+                    else:
+                        # 还没到：短睡重试，1→8 倍退避，久等才逐步降频
+                        scale = min(8, 1 + spin // 2)
+                        time.sleep(min(minbl / 4.0 * scale, 0.05))
                     spin += 1
                     elapsed = time.perf_counter_ns() - self._idle_start_time
                     if elapsed / 1e9 > dflt * 4:
@@ -353,25 +361,25 @@ class Engine:
         }
 
     # ---------- 设备 ----------
-    def list_outputs(self):
-        out = []
+    def list_devices(self):
+        """一次枚举同时得到「监听输入（虚拟声卡）」与「真实输出」。
+
+        原来 list_inputs()/list_outputs() 各自调一次 sc.all_speakers()，
+        等于把同一份 WASAPI 端点枚举跑两遍；这里合并成一次。
+        """
+        ins, outs = [], []
         try:
             for s in sc.all_speakers():
-                if not is_virtual(s.name):
-                    out.append(s.name)
+                (ins if is_virtual(s.name) else outs).append(s.name)
         except Exception:
             pass
-        return out
+        return ins, outs
+
+    def list_outputs(self):
+        return self.list_devices()[1]
 
     def list_inputs(self):
-        out = []
-        try:
-            for s in sc.all_speakers():
-                if is_virtual(s.name):
-                    out.append(s.name)
-        except Exception:
-            pass
-        return out
+        return self.list_devices()[0]
 
     def _pick_input(self, cfg):
         want = (cfg.get("input_device") or "").strip().lower()
@@ -465,12 +473,14 @@ class Engine:
             except Exception:
                 pass
 
-    def _rdp_blocked(self, cfg):
+    def _rdp_blocked(self, cfg=None):
         """远程桌面场景 + 用户没开「在远程桌面中接管」→ 不碰声音。
 
         「不碰」是字面意思：不打开采集/播放设备、不处理、也不改系统默认输出。
         这样 RDP 里的声音会原样走对面设备；用户把开关打开后才像本机一样接管。
+        cfg 可以传配置快照，也可以不传（直接读当前配置，省一次拷贝）。
         """
+        cfg = cfg if cfg is not None else self.config
         return session.blocked(bool(cfg.get("rdp_takeover", False)))
 
     def _set_pause(self, reason):
@@ -486,8 +496,7 @@ class Engine:
         ensure_com()
         backoff = 1.0
         while self._run:
-            cfg = self.config.snapshot()
-            if self._rdp_blocked(cfg):
+            if self._rdp_blocked():
                 self._set_pause("rdp")
                 # 0.5 秒看一次配置/会话状态：用户在界面上打开接管就立刻恢复
                 if self._stop.wait(0.5):
@@ -543,7 +552,10 @@ class Engine:
         dc = DcBlocker(SR, fc=self._num(cfg, "dc_blocker_hz", 10, 1, 120), channels=CHANNELS)
 
         state = {"gain": 0.0, "lufs": -70.0, "underrun": 0, "warm": 0.0,
-                 "win_vol": 1.0}
+                 "win_vol": 1.0,
+                 # Windows 音量：每块都去读端点音量是 200 次/秒 COM 调用，
+                 # 改成每 100ms 读一次，人耳完全感觉不到延迟，CPU 省一大截
+                 "vol_at": 0.0, "vol_scalar": 1.0, "vol_gain": 1.0}
         self._thread_error = None      # 工作线程的现场：不许再悄悄吞掉
         # 门控要按「监听输入这个端点」查会话；找不到就 None（函数里兑底为 True）
         try:
@@ -678,13 +690,29 @@ class Engine:
             ensure_com()
             boost_current_thread()
             last = time.time()
+            # ---- 静音快路径 ----
+            # 连续静音超过 ~0.3 秒后，整条链路对零输入毫无意义（下混、去直流、
+            # K 加权、测响度、限幅全是白算），直接把预置零块送给声卡。
+            # 进来之前已经连续送了 0.3 秒的真零块，滤波器状态基本归零，
+            # 所以离开时要 reset 一次，绝不能把静音期的陈旧状态带进下一段音乐。
+            zeros = np.zeros((blk, CHANNELS), dtype=np.float32)
+            fast = False
+            quiet = 0
+            quiet_need = max(8, int(300.0 / max(float(block_ms), 1.0)))
+            # 配置快照按版本号缓存：每块 deepcopy 一份配置在 100 块/秒时纯属浪费
+            # （第一次循环发现版本号变了就会装进来，所以这里先放空）
+            hot = {"cfg": None, "ver": -1}
             try:
                 with _Out(out_dev, buffer_ms=deadband_ms) as pl:
                     self._publish(out_mode=pl.mode)
                     while self._run and not self._stop.is_set():
-                        # 每块重读配置：否则界面上改「启用/直通/目标响度」都要重启才生效
-                        # （原来只在会话开始时读一次，这就是"勾了直通却没变化"的原因）
-                        cfg = self.config.snapshot()
+                        # 配置变了（改「启用/直通/目标响度」等）立刻跟着变，
+                        # 没变就复用上一份，避免每块 deepcopy
+                        ver = self.config.version()
+                        if ver != hot["ver"]:
+                            hot["ver"] = ver
+                            hot["cfg"] = self.config.view()
+                        cfg = hot["cfg"]
                         try:
                             item = q.get(timeout=0.05)
                         except queue.Empty:
@@ -709,6 +737,42 @@ class Engine:
                             x = np.pad(x, ((0, max(pad, 0)), (0, 0)))[:blk]
                         if not np.all(np.isfinite(x)):
                             x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+                        # 数字静音（一块全是 0）才是快路径的目标；-0.000001 这种
+                        # 底噪块不算，老老实实走完整链路，绝不会漏掉真实声音
+                        silent_block = not x.any()
+                        quiet = quiet + 1 if silent_block else 0
+                        if fast and not silent_block:
+                            # 有声音了：清掉静音期留下的滤波器状态与增益，
+                            # 否则第一个块会带着陈旧状态出现台阶（咔哒/泵一下）
+                            fast = False
+                            dc.reset()
+                            kw.reset()
+                            meter.reset()
+                            state["warm"] = 0.0
+                            state["gain"] = 0.0
+                        if silent_block and (fast or quiet >= quiet_need):
+                            if not fast:
+                                fast = True
+                                dc.reset()
+                                kw.reset()
+                                meter.reset()
+                                state["warm"] = 0.0
+                                state["gain"] = 0.0
+                                state["lufs"] = -70.0
+                            pl.play(zeros)
+                            now = time.time()
+                            if now - last > 0.25:
+                                last = now
+                                self._publish(lufs=-70.0, gain_db=0.0,
+                                              pre_db=state.get("pre_db", 0.0),
+                                              win_vol=state.get("win_vol", 1.0),
+                                              underrun=state["underrun"],
+                                              buffered=q.qsize(),
+                                              out_starves=pl.starves,
+                                              out_pad_ms=round(pl.min_pad_ms, 1))
+                            continue
+
                         x = np.clip(x, -4.0, 4.0)
                         x = dc.process(x)
 
@@ -726,21 +790,24 @@ class Engine:
                         # Windows 音量滑块：先读出增益倍数，放进限幅之前一起处理，
                         # 这样 100%（+10dB）时被限幅器兜住，不会硬削波。
                         # 测量仍是增益前的 x，所以调音量不影响响度判定。
-                        if win_vol is not None:
+                        now = time.time()
+                        if win_vol is not None and (now - state["vol_at"]) >= 0.1:
+                            state["vol_at"] = now
                             try:
                                 if win_vol.GetMute():
-                                    vol_gain = 0.0
-                                    vol_scalar = 0.0
+                                    state["vol_scalar"] = 0.0
+                                    state["vol_gain"] = 0.0
                                 else:
-                                    vol_scalar = float(win_vol.GetMasterVolumeLevelScalar())
-                                    vol_gain = volume_curve(
-                                        vol_scalar,
+                                    scalar = float(win_vol.GetMasterVolumeLevelScalar())
+                                    state["vol_scalar"] = scalar
+                                    state["vol_gain"] = volume_curve(
+                                        scalar,
                                         self._num(cfg, "winvol_ref", 0.20, 0.02, 0.8),
                                         self._num(cfg, "winvol_max_db", 10.0, 0, 20))
                             except Exception:
-                                vol_scalar, vol_gain = 1.0, 1.0
-                        else:
-                            vol_scalar, vol_gain = 1.0, 1.0
+                                state["vol_scalar"], state["vol_gain"] = 1.0, 1.0
+                        vol_scalar = state["vol_scalar"]
+                        vol_gain = state["vol_gain"]
                         state["win_vol"] = vol_scalar
 
                         if bool(cfg.get("passthrough", False)):
@@ -813,7 +880,7 @@ class Engine:
                 break
             # 运行途中被远程桌面挤掉（或用户打开/关闭「接管远程桌面」）：
             # 立刻收工回到暂停态，别继续占着 CABLE 和默认输出
-            if self._rdp_blocked(self.config.snapshot()):
+            if self._rdp_blocked():
                 self._stop.set()
                 break
             time.sleep(0.25)

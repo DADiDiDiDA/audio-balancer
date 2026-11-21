@@ -11,6 +11,7 @@
      把本地会话挤掉了（这时本机没人听声音，继续抢 CABLE 只会让两边都别扭）。
 """
 import ctypes
+import time
 
 SM_REMOTESESSION = 0x1000
 WTS_CURRENT_SESSION = -1
@@ -21,17 +22,23 @@ WTS_ACTIVE = 0
 WTS_DISCONNECTED = 4
 
 _flag = None       # 进程在哪个会话是启动时就定死的，只探测一次就够
+_sid = None
+_detached = {"t": -1e9, "value": False}
 
 
 def session_id():
     """本进程所在的 Windows 会话 ID（控制台一般是 1，远程桌面是 2 起）。"""
+    global _sid
+    if _sid is not None:
+        return _sid
     try:
         sid = ctypes.c_ulong(0xFFFFFFFF)
         k32 = ctypes.windll.kernel32
         k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid))
-        return int(sid.value)
+        _sid = int(sid.value)
     except Exception:
-        return -1
+        _sid = -1
+    return _sid
 
 
 def _wts_query(cls, fmt):
@@ -80,15 +87,24 @@ def connect_state():
     return int(v) if v is not None else -1
 
 
-def console_detached():
-    """在控制台会话里，但它现在是「已断开」（通常是被远程桌面挤掉的）。"""
+def console_detached(ttl=1.5):
+    """在控制台会话里，但它现在是「已断开」（通常是被远程桌面挤掉的）。
+
+    结果缓存 ttl 秒：引擎每块、界面每次刷新都会问一次，
+    真去查 WTS 每次都是内核/LSA 调用，没必要。
+    """
+    now = time.time()
+    if now - _detached["t"] < ttl:
+        return _detached["value"]
+    value = False
     try:
-        if is_remote():
-            return False
-        console = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId()
-        return int(console) == session_id() and connect_state() == WTS_DISCONNECTED
+        if not is_remote():
+            console = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId()
+            value = int(console) == session_id() and connect_state() == WTS_DISCONNECTED
     except Exception:
-        return False
+        value = False
+    _detached["t"], _detached["value"] = now, value
+    return value
 
 
 def blocked(takeover=False):

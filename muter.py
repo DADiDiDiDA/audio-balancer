@@ -16,8 +16,11 @@ import ctypes
 import os
 
 import psutil
-from pycaw.api.audiopolicy import IAudioSessionControl2
+from comtypes import CLSCTX_ALL
+from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
 from pycaw.pycaw import AudioSession, AudioUtilities
+
+from device_guard import default_render
 
 # 必须忽略的会话：系统提示音、音频引擎、本程序自己
 # 注意：本程序 exe 名是「音频均衡器.exe」，光靠名字容易漏，
@@ -64,7 +67,15 @@ class Muter:
     def _enum(self):
         out = []
         try:
-            mgr = AudioUtilities.GetAudioSessionManager()
+            # 直接在默认端点上 Activate 会话管理器：pycaw 的
+            # GetAudioSessionManager() 走的是 GetSpeakers()→CreateDevice，
+            # 每次都要把端点属性表读一遍（~10ms），3 秒一轮纯属浪费。
+            try:
+                ptr = default_render()
+                mgr = ptr.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
+                mgr = mgr.QueryInterface(IAudioSessionManager2)
+            except Exception:
+                mgr = AudioUtilities.GetAudioSessionManager()   # 兜底
             if mgr is None:
                 return out
             enum = mgr.GetSessionEnumerator()
@@ -194,7 +205,12 @@ class Muter:
                 if s.ProcessId == self._self_pid:
                     continue
                 key = self._key(s)
-                s.SimpleAudioVolume.SetMasterVolume(self._orig.get(key, 1.0), None)
+                # 只还原「我们确实动过」的会话。以前缺省写 1.0，等于把没被处理过
+                # 的程序（新开的、在忽略名单里的）音量强行拉到 100% —— 退出/关开关
+                # 时莫名其妙声音变大就是这么来的。
+                if key not in self._orig:
+                    continue
+                s.SimpleAudioVolume.SetMasterVolume(self._orig[key], None)
             except Exception:
                 continue
         self._vol.clear()
