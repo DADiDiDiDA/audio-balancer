@@ -291,6 +291,11 @@ class Button:
             pass
 
     def set_text(self, text, fg=None):
+        # 文字没变就别 configure：Tk 每次 itemconfigure 都会标记重绘，
+        # 界面每秒 4~5 次空更新是空闲时白白吃掉 CPU 的元凶之一
+        if text == getattr(self, "_text", None) and fg == getattr(self, "_fg", None):
+            return
+        self._text, self._fg = text, fg
         try:
             self.cv.itemconfigure(self.label, text=text)
             if fg:

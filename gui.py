@@ -92,6 +92,7 @@ class AppWindow:
         self._btn_save = None
         self._tip_text = None      # 当前悬停的说明文字
         self._tip_ids = []         # 气泡的 canvas item（重建页面时清掉）
+        self._live = {}            # 实时数值的「上次显示值」，没变就不重绘
         self.meter = None
         self.m_band = None
         self._glass_raw = None
@@ -374,6 +375,7 @@ class AppWindow:
         self._btn_save = None
         self._tip_ids = []          # delete("all") 已经连带删掉气泡
         self._tip_text = None
+        self._live = {}             # 画布重建了，缓存的「上次显示值」全部作废
 
         W = max(self.body.winfo_width(), 640)
         H = max(self.body.winfo_height(), 520)
@@ -810,18 +812,12 @@ class AppWindow:
         if paused == "rdp" and not bool(st.get("running")):
             self._set_foot("远程桌面会话中：按设置不接管声音（可在「音频设备」页开启）",
                            pal["warn"])
-        elif self.page == "loudness":
-            cv = self._painter.cv if self._painter else None
-            if cv is not None:
-                try:
-                    cv.itemconfigure(self.m_lufs, text=_fmt_lufs(lufs))
-                    cv.itemconfigure(self.m_gain, text="增益 " + _fmt_db(gain))
-                    cv.itemconfigure(self.m_mode,
-                                     text=("已绕过音效" if st.get("out_mode") == "raw"
-                                           else "经系统音效"))
-                    cv.coords(self.m_mark, self._mmap(lufs) - 2, self.meter[2] - 10)
-                except Exception:
-                    pass
+        elif self.page == "loudness" and self._painter is not None:
+            self._set_live_text("lufs", self.m_lufs, _fmt_lufs(lufs))
+            self._set_live_text("gain", self.m_gain, "增益 " + _fmt_db(gain))
+            self._set_live_text("mode", self.m_mode,
+                                "已绕过音效" if st.get("out_mode") == "raw" else "经系统音效")
+            self._set_mark(lufs)
             foot = ("响度 %s LUFS · 增益 %s · Win音量 %.0f%%" % (
                 _fmt_lufs(lufs), _fmt_db(gain),
                 float(st.get("win_vol", 1.0) or 1.0) * 100))
@@ -836,7 +832,42 @@ class AppWindow:
         if self.page == "device":
             self._update_default_label()
 
+    def _set_live_text(self, key, item, text):
+        """实时数值只在真的变化时写回。
+
+        Tk 的 itemconfigure 即使值没变也会标记重绘；界面 4~5 次/秒的空更新
+        会让一个「什么都不做」的窗口也吃掉几个点 CPU。
+        """
+        if item is None:
+            return
+        cache = self._live
+        if cache.get(key) == text:
+            return
+        cache[key] = text
+        cv = self._painter.cv if self._painter else None
+        if cv is None:
+            return
+        try:
+            cv.itemconfigure(item, text=text)
+        except Exception:
+            pass
+
+    def _set_mark(self, lufs):
+        if not self.meter or self.m_mark is None:
+            return
+        x = round(self._mmap(lufs) - 2, 1)
+        if self._live.get("mark") == x:
+            return
+        self._live["mark"] = x
+        try:
+            self._painter.cv.coords(self.m_mark, x, self.meter[2] - 10)
+        except Exception:
+            pass
+
     def _set_foot(self, text, color):
+        if self._live.get("foot") == (text, color):
+            return
+        self._live["foot"] = (text, color)
         cv = self.body
         try:
             items = cv.find_withtag("foot")
@@ -856,6 +887,9 @@ class AppWindow:
             line += "　· 远程桌面：不接管"
         elif g.get("virtual"):
             line += "　（虚拟声卡 · 正常）"
+        if self._live.get("default") == line:
+            return
+        self._live["default"] = line
         try:
             self._painter.cv.itemconfigure(
                 self.m_default, text=line,
