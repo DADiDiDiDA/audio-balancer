@@ -7,6 +7,7 @@ ui_kit 用 PIL 形状 + Canvas 文本画出来，所以圆角抗锯齿、hover �
 刷新策略：页面内容只在切页 / 改窗口大小 / 改动后重建；实时数值（响度、
 增益、状态、保存状态）只改文字和坐标，不重建 —— 否则拖滑块会被打断。
 """
+import math
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -20,7 +21,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 SIDE_W = 192
 
@@ -66,7 +67,26 @@ PRESET_KEYS = ("level_mode", "target_lufs", "target_range_db",
 
 
 
+def _as_float(v, default=0.0):
+    """状态文件里的数值可能缺失 / 是 None / 是字符串 / 是 NaN，统一收口。
+
+    失败或非有限值都返回 default（可以是 None），调用方不用再各写一遍 try。
+    """
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
+
+
 def _fmt_db(v):
+    """增益显示。非有限值（NaN/inf）一律显示「—」：曾经会把 "nan" 直接画到界面上。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
+        return "—"
     return "关闭" if v <= -39.5 else "%+.1f dB" % v
 
 
@@ -80,6 +100,13 @@ def _latency_ms(block_ms):
 
 
 def _fmt_lufs(v):
+    """响度显示。NaN / ±inf / 非数字都不能漏到界面上（只显示「—」）。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
+        return "—"
     return "静音" if v < -60 else "%.1f" % v
 
 
@@ -511,8 +538,9 @@ class AppWindow:
         self.m_band = None
         self.m_band_txt = p.text((mx0 + mx1) / 2, my + 22, "", 8, pal["sub"], anchor="center")
         self._draw_band()
-        self.m_mark = ui_kit.shape(p.cv, self._mmap(float(self.engine.status.get("lufs", -70))) - 2,
-                                   my - 10, 5, 20, 2.5, fill=pal["accent"])
+        self.m_mark = ui_kit.shape(
+            p.cv, self._mmap(_as_float(self.engine.status.get("lufs"), -70.0)) - 2,
+            my - 10, 5, 20, 2.5, fill=pal["accent"])
         p.text(mx0, my + 22, "−45", 8, pal["dim"])
         p.text(mx1, my + 22, "−5", 8, pal["dim"], anchor="e")
 
@@ -576,14 +604,15 @@ class AppWindow:
                     "比目标低 34 dB 以上的片段不会再提升（护底噪拐点）。")
         p.field(x + 22, ly + 98, col, "限幅上限",
                 float(cfg.get("limiter_ceiling_db", -1)), -6, 0, 0.5,
-                self._on_ceiling, fmt=lambda v: "%.1f dBFS" % v,
+                self._on_ceiling, fmt=lambda v: "%.1f dBTP" % v,
                 tip="输出的绝对上限，按真峰值（dBTP）算：会检查采样点之间的峰值，"
                     "不是只看采样点。留 −1 dB 是给 AAC/MP3 重编码的余量。")
         p.field(x + 22 + col + 26, ly + 98, col, "处理前降低",
                 float(cfg.get("pre_gain_db", 0)), -24, 0, 1,
                 self._on_pre, fmt=lambda v: "%+.0f dB" % v,
                 tip="整体先降这么多再处理：等于把音量基准放低，同时给限幅器留更多余量。")
-        p.text(x + 22, ly + 150, "直通：完全不做处理，只把声音原样送到耳机", 9, pal["sub"])
+        p.text(x + 22, ly + 150, "直通：不做响度处理，原样送到耳机（保留 0 dBFS 过载保护）",
+               9, pal["sub"])
         p.toggle(x + w - 24 - 46, ly + 142,
                  lambda: bool(cfg.get("passthrough", False)), self._on_passthrough)
 
@@ -835,8 +864,10 @@ class AppWindow:
     def _update_live(self):
         st = self.engine.status
         pal = self.pal
-        lufs = float(st.get("lufs", -70))
-        gain = float(st.get("gain_db", 0))
+        # 状态文件来自另一个进程：字段缺失、None、字符串、NaN 都可能出现，
+        # 这里统一收口，宁可显示「—」也不能让格式化抛异常（抛了就不刷新了）
+        lufs = _as_float(st.get("lufs"), -70.0)
+        gain = _as_float(st.get("gain_db"), 0.0)
         err = st.get("error")
         waiting = bool(st.get("waiting"))
         paused = st.get("paused")
@@ -850,11 +881,11 @@ class AppWindow:
                                 "已绕过音效" if st.get("out_mode") == "raw" else "经系统音效")
             self._set_mark(lufs)
             parts = ["响度 %s LUFS" % _fmt_lufs(lufs), "增益 " + _fmt_db(gain)]
-            tp = st.get("out_tp_db")
-            if isinstance(tp, (int, float)) and tp > -90:
+            tp = _as_float(st.get("out_tp_db"), None)
+            if tp is not None and tp > -90 and math.isfinite(tp):
                 parts.append("峰值 %.1f dBTP" % tp)
             parts.append("Win音量 %.0f%%"
-                         % (float(st.get("win_vol", 1.0) or 1.0) * 100))
+                         % (_as_float(st.get("win_vol"), 1.0) * 100))
             self._set_foot(" · ".join(parts), pal["sub"])
         elif err:
             self._set_foot(str(err), pal["err"])

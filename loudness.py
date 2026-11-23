@@ -13,43 +13,60 @@ import numpy as np
 from scipy.signal import sosfilt, sosfilt_zi
 
 
-def _rbj_sos(kind, fs, f0, q=None, gain_db=None):
-    """RBJ Audio EQ Cookbook 双二阶滤波器，返回 sos 行 [b0,b1,b2,a0,a1,a2]。"""
-    w0 = 2.0 * np.pi * f0 / fs
-    cw, sw = np.cos(w0), np.sin(w0)
-    if kind == "highpass":
-        alpha = sw / (2.0 * q)
-        b0, b1, b2 = (1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0
-        a0, a1, a2 = 1.0 + alpha, -2.0 * cw, 1.0 - alpha
-    elif kind == "highshelf":
-        a = 10.0 ** (gain_db / 40.0)
-        alpha = sw / (2.0 * q)
-        sq = 2.0 * np.sqrt(a) * alpha
-        b0 = a * ((a + 1.0) + (a - 1.0) * cw + sq)
-        b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cw)
-        b2 = a * ((a + 1.0) + (a - 1.0) * cw - sq)
-        a0 = (a + 1.0) - (a - 1.0) * cw + sq
-        a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cw)
-        a2 = (a + 1.0) - (a - 1.0) * cw - sq
-    else:
-        raise ValueError("未知的滤波器类型: %s" % kind)
-    return np.array([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+# ---------------------------------------------------------------- 标准系数
+# ITU-R BS.1770-4 的两个 K 加权滤波器参数（Table 1/2 的模拟原型参数）。
+# 采样率**必须**参与设计：转折频率是按 fs 算的，直接拿 48k 的系数去处理
+# 44.1k/96k 的声音，两个转折点会整体偏移 8%~100%（实测宽带内容读数偏
+# 0.09 dB，高频多的内容更多），而且越偏离 48k 越明显。
+SHELF_F0 = 1681.974450955533
+SHELF_GAIN_DB = 3.999843853973347
+SHELF_Q = 0.7071752369554196
+HP_F0 = 38.13547087602444
+HP_Q = 0.5003270373238773
+# 标准里高架滤波器的"中频增益"指数不是 0.5，而是这个值 —— 用它才能在
+# 48kHz 下逐位复现 BS.1770-4 公布的系数表（差 <1e-15）。
+_VB_EXP = 0.4996667741545416
+
+
+def _shelf_sos(fs):
+    """第一级：高架滤波器（+4 dB @ 高频），双线性变换 + 频率预畸变。"""
+    k = np.tan(np.pi * SHELF_F0 / fs)
+    vh = 10.0 ** (SHELF_GAIN_DB / 20.0)
+    vb = vh ** _VB_EXP
+    a0 = 1.0 + k / SHELF_Q + k * k
+    return np.array([(vh + vb * k / SHELF_Q + k * k) / a0,
+                     2.0 * (k * k - vh) / a0,
+                     (vh - vb * k / SHELF_Q + k * k) / a0,
+                     1.0,
+                     2.0 * (k * k - 1.0) / a0,
+                     (1.0 - k / SHELF_Q + k * k) / a0])
+
+
+def _highpass_sos(fs):
+    """第二级：RLB 高通（38 Hz），同样的预畸变双线性设计。"""
+    k = np.tan(np.pi * HP_F0 / fs)
+    a0 = 1.0 + k / HP_Q + k * k
+    return np.array([1.0, -2.0, 1.0,
+                     1.0,
+                     2.0 * (k * k - 1.0) / a0,
+                     (1.0 - k / HP_Q + k * k) / a0])
+
+
+def k_weighting_sos(fs=48000):
+    """返回两段 sos。48kHz 下与 BS.1770-4 公布系数逐位一致。"""
+    return np.vstack([_shelf_sos(float(fs)), _highpass_sos(float(fs))])
 
 
 class KWeighting:
-    """K-weighting 滤波器组，逐块流式处理，保持 IIR 状态。"""
+    """K-weighting 滤波器组，逐块流式处理，保持 IIR 状态。
+
+    系数按实际采样率现算（见 k_weighting_sos），不是写死 48k 的表。
+    """
 
     def __init__(self, sr=48000, channels=2):
         self.sr = int(sr)
         self.channels = int(channels)
-        shelf = _rbj_sos("highshelf", self.sr,
-                         f0=1681.974450955533,
-                         q=0.7071752369554196,
-                         gain_db=3.999843853973347)
-        highpass = _rbj_sos("highpass", self.sr,
-                            f0=38.13547087602444,
-                            q=0.5003270373238773)
-        self.sos = np.vstack([shelf, highpass])
+        self.sos = k_weighting_sos(self.sr)
         # 关键：初始状态必须为零。若用 sosfilt_zi（单位阶跃稳态）初始化，
         # 零输入也会产生衰减瞬态，表现为启动/切换时的一声"噗"爆音（实测峰值 1.5）。
         self.zi0 = np.zeros((self.sos.shape[0], 2, 1))

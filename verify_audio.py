@@ -49,15 +49,21 @@ try:
 except Exception as exc:
     print("  打不开 RAW（会回退共享模式）:", exc)
 
-print("--- 2) 直通时的软膝限幅（0 dBFS） ---")
+print("--- 2) 直通路径：0 dBTP 天花板（与正常路径同一个限幅器） ---")
+from dsp import TruePeakLimiter
+
 x = np.linspace(0, 2 * np.pi * 3, 4800)
-loud = (1.6 * np.sin(x))[:, None].astype(np.float64)
-y = E.soft_limit(loud, 0.0)
-check(float(np.abs(y).max()) <= 1.0001, "峰值被压到满刻度以内（%.4f）" % float(np.abs(y).max()))
-check(float(np.max(np.abs(np.diff(y, axis=0)))) < 0.2,
-      "限幅后没有阶跃（最大步进 %.3f）" % float(np.max(np.abs(np.diff(y, axis=0)))))
-quiet = (0.3 * np.sin(x))[:, None]
-check(np.array_equal(E.soft_limit(quiet, 0.0), quiet), "低于膝点的信号一个采样都不改")
+loud = np.repeat((1.6 * np.sin(x))[:, None], 2, axis=1).astype(np.float64)
+lim = TruePeakLimiter(SR, 2, ceiling_db=0.0)
+y = np.concatenate([lim.process(loud[i:i + 480]) for i in range(0, loud.shape[0], 480)])
+check(float(np.abs(y).max()) <= 1.0 + 1e-6,
+      "峰值被压到满刻度以内（%.4f）" % float(np.abs(y).max()))
+quiet = np.repeat((0.3 * np.sin(x))[:, None], 2, axis=1)
+lim2 = TruePeakLimiter(SR, 2, ceiling_db=0.0)
+q = np.concatenate([lim2.process(quiet[i:i + 480]) for i in range(0, quiet.shape[0], 480)])
+n = lim2.n
+check(np.allclose(q[n:], quiet[:-n], atol=1e-12),
+      "低于天花板的信号一个采样都不改（只是整体延迟 %d 采样）" % n)
 
 print("--- 2b) 低电平拐点：弱信号不放大 ---")
 # 目标 -18、拐点 -52（目标-34）、过渡 10dB

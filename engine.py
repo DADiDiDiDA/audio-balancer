@@ -218,19 +218,6 @@ def endpoint_has_active_session(pycaw_dev):
         return True
 
 
-def soft_limit(x, ceiling_db):
-    """软膝限幅：峰值接近上限时平滑压缩，避免硬削波的刺耳失真。"""
-    ceiling = 10.0 ** (ceiling_db / 20.0)
-    knee = ceiling * 0.8
-    a = np.abs(x)
-    if not np.any(a > knee):
-        return x
-    span = max(ceiling - knee, 1e-6)
-    over = (a - knee) / span
-    limited = knee + span * np.tanh(over)
-    return np.where(a > knee, np.sign(x) * limited, x)
-
-
 def apply_gain_ramp(x, total, state):
     """输出增益按样本线性过渡，避免「块间增益台阶」造成的拉链噪声。
 
@@ -838,15 +825,16 @@ class Engine:
 
                         if bool(cfg.get("passthrough", False)):
                             # 直通：不做电平调整，原样搬运（排查 / 只要自动静音时用）。
-                            # 但音量与前级仍可能把信号推过满刻度，所以仍过一遍 0 dBFS
-                            # 软膝：低于 0.8 FS 一个采样都不动，超过才平滑压住，
-                            # 比让驱动硬削波干净得多。
+                            # 但仍走同一个限幅器，只是把天花板抬到 0 dBTP：
+                            #   · 低于满刻度的样本一个都不改（只拦硬削波）；
+                            #   · 链路延迟保持恒定 2ms —— 以前直通走另一条
+                            #     soft_limit 路径（没有前瞻），每次切换都会把
+                            #     限幅器缓冲里的 2ms 音频吞掉，听起来是轻微跳一下。
                             state["gain"] = 0.0
                             y = apply_gain_ramp(x, pre * vol_gain, state)
-                            y = soft_limit(y, 0.0)
-                            # 直通不过限幅器，峰值读数置空（别把上一段的旧值留着）
-                            limiter.last_tp = 0.0
-                            limiter.last_gr_db = 0.0
+                            if limiter.ceiling_db != 0.0:
+                                limiter.set_ceiling(0.0)
+                            y = limiter.process(y)
                         else:
                             gate = self._num(cfg, "silence_gate_lufs", -60, -90, -20)
                             enabled = bool(cfg.get("enabled", True))

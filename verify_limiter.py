@@ -108,6 +108,24 @@ y = run(lim, low)
 check(np.isfinite(y).all(), "输出全部有限")
 check(float(np.abs(y).max()) <= 10 ** (-1.0 / 20.0) + 0.02, "低频大信号也被限住")
 
+print("--- 7) 切换直通（改天花板）不产生时间跳变或缺口 ---")
+# 引擎里「直通」不再换到另一条没有前瞻的路径，只是把同一个限幅器的天花板
+# 从 -1 抬到 0 dBTP。这里模拟连续音频在中途切换，输出必须仍然是
+# 「输入整体延迟 n 采样」—— 一旦换路径/清缓冲，这里会多出 2ms 的洞。
+x = sine(0.3, 0.4, freq=440.0)          # 远低于两个天花板，不该被限
+lim = TruePeakLimiter(SR, 2, ceiling_db=-1.0, lookahead_ms=2.0)
+outs = []
+for i in range(0, x.shape[0], 480):
+    if (i // 480) == 12:
+        lim.set_ceiling(0.0)            # 切到直通
+    if (i // 480) == 24:
+        lim.set_ceiling(-1.0)           # 再切回来
+    outs.append(lim.process(x[i:i + 480]))
+y = np.concatenate(outs, axis=0)
+n = lim.n
+check(np.allclose(y[n:], x[:-n], atol=1e-9),
+      "切换天花板前后，输出仍是输入的纯延迟（无缺口/无重复）")
+
 print("\n%s（%d 项失败）" % ("全部通过" if not fails else "有失败", len(fails)))
 for f in fails:
     print("  -", f)

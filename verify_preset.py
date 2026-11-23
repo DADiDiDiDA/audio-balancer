@@ -146,6 +146,31 @@ check(app._preset_index() == 3 and cfg.get("loud_preset") == "电影",
 click_chip(0)
 check(app._preset_index() == 0, "再从预设点回「自定义」仍然生效")
 
+# 9) 状态里出现 NaN / None：界面既不能崩，也不能把 "nan" 画出来
+from gui import _fmt_db, _fmt_lufs       # noqa: E402
+
+check(_fmt_lufs(float("nan")) == "—" and _fmt_lufs(float("inf")) == "—",
+      "响度格式化对 NaN/inf 返回「—」")
+check(_fmt_db(float("nan")) == "—", "增益格式化对 NaN 返回「—」")
+app._goto("loudness")
+pump(0.2)
+app.engine.status.update({"lufs": float("nan"), "gain_db": float("nan"),
+                          "out_tp_db": float("nan"), "win_vol": None})
+try:
+    app._update_live()
+    ok = True
+except Exception as exc:                  # noqa: BLE001
+    ok = False
+    print("   异常:", exc)
+check(ok, "状态里有 NaN/None 时实时刷新不抛异常（抛了界面就永久不刷新）")
+try:
+    foot = app.body.itemcget(app.body.find_withtag("foot")[0], "text")
+except Exception:
+    foot = ""
+print("   状态栏：%r" % foot)
+check("nan" not in foot.lower() and "inf" not in foot.lower(),
+      "状态栏没有 nan/inf 字样")
+
 app.hide()
 root.destroy()
 print("\n%s（%d 项失败）" % ("全部通过" if not fails else "有失败", len(fails)))

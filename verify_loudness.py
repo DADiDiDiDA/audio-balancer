@@ -10,10 +10,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from scipy.signal import sosfilt
 
-from loudness import KWeighting, SlidingLUFS, _rbj_sos
+from loudness import KWeighting, SlidingLUFS, k_weighting_sos
 
 SR = 48000
 fails = []
+
+# BS.1770-4 公布的 48kHz K 加权系数（独立于产品代码，作为对照）
+OFFICIAL = np.array([[1.53512485958697, -2.69169618940638, 1.19839281085285,
+                      1.0, -1.69065929318241, 0.73248077421585],
+                     [1.0, -2.0, 1.0,
+                      1.0, -1.99004745483398, 0.99007225036621]])
 
 
 def check(cond, msg):
@@ -37,15 +43,37 @@ def ref_lufs_from_z(zs, ns, abs_gate=-70.0, rel_gate=-10.0):
 
 
 def kweight(x):
-    shelf = _rbj_sos("highshelf", SR, 1681.974450955533, 0.7071752369554196, 3.999843853973347)
-    hp = _rbj_sos("highpass", SR, 38.13547087602444, 0.5003270373238773)
-    sos = np.vstack([shelf, hp])
-    return sosfilt(sos, x)
+    """用标准公布的系数滤波（参考实现，不调用产品代码的设计函数）。"""
+    return sosfilt(OFFICIAL, x, axis=0)
 
 
 def tone(amp, sec, freq=1000.0):
     t = np.arange(int(SR * sec)) / SR
     return amp * np.sin(2 * np.pi * freq * t)
+
+
+print("--- 0) 系数与采样率 ---")
+got = k_weighting_sos(SR)
+check(float(np.max(np.abs(got - OFFICIAL))) < 1e-9,
+      "48kHz 系数与 BS.1770-4 公布表一致（最大差 %.1e）"
+      % float(np.max(np.abs(got - OFFICIAL))))
+# 同一信号在 44.1/48/96k 下必须测出同一个数（系数没跟着采样率改就会漂）
+vals = {}
+for fs in (44100, 48000, 96000):
+    m = SlidingLUFS(fs, 1000)
+    k = KWeighting(fs, 2)
+    t = np.arange(int(fs * 1.2)) / fs
+    x = np.repeat((0.1 * np.sin(2 * np.pi * 1000 * t))[:, None], 2, axis=1)
+    step = int(fs * 0.02)
+    for i in range(0, x.shape[0], step):
+        v = float(m.update(k.process(x[i:i + step])))
+    vals[fs] = v
+check(max(vals.values()) - min(vals.values()) < 0.1,
+      "同一信号在 44.1/48/96kHz 下读数一致（极差 %.3f dB）"
+      % (max(vals.values()) - min(vals.values())))
+# 校准：双声道 -20 dBFS 的 1kHz 正弦 ≈ -20 LUFS（BS.1770 的参考点）
+check(abs(vals[48000] + 20.0) < 0.15,
+      "双声道 -20dBFS / 1kHz 正弦读作 %.2f LUFS（参考点 -20）" % vals[48000])
 
 
 print("--- 1) 与参考实现逐块对照 ---")
