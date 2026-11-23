@@ -137,7 +137,8 @@ class Muter:
         self.foreground = foreground_process_name()
         self.in_game = bool(games) and self.foreground in games
         mute_bg_listed = bool(cfg.get("mute_listed_in_background", True))
-        mute_others = bool(cfg.get("mute_others_in_game", True))
+        # 与 config.DEFAULTS 保持一致（这里以前写 True，缺键时行为和界面对不上）
+        mute_others = bool(cfg.get("mute_others_in_game", False))
 
         fg_vol = float(cfg.get("mute_fg_volume", 1.0))
         bg_vol = float(cfg.get("mute_bg_volume", 0.0))

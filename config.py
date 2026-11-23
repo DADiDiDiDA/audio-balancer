@@ -18,6 +18,10 @@ DEFAULTS = {
     #   limit = 仅限制（只压超过目标的，安静内容原样通过）
     #   auto  = 自动电平（低于目标范围提上来、高于范围压下去、范围内不动）
     "level_mode": "auto",
+    # 当前选中的音量均衡预设：预设名 / "custom" / ""（空 = 按数值反推，兼容旧配置）。
+    # 为什么需要它：以前「选中哪一档」是靠数值反推的，点「自定义」不写任何值，
+    # 反推回去还是原来那档 —— 表现为「点了自定义没反应，必须先改个数才行」。
+    "loud_preset": "",
     "target_lufs": -18.0,
     # 目标是个范围：target ± range 之内不处理，超出才拉回边缘。
     # 只有自动电平模式用它（仅限制模式 range 视为 0）。
@@ -105,22 +109,27 @@ class Config:
         self.load()
 
     def load(self):
+        """从磁盘重读。返回是否真的读到了不一样的值（界面用它决定要不要重绘）。"""
+        changed = False
         try:
             # utf-8-sig：别人（编辑器 / PowerShell）保存时可能带 BOM，
             # 用 utf-8 读会直接抛异常 → 整个配置静默失效，绝不能这样。
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                for k, v in data.items():
-                    if k in DEFAULTS:
-                        self._data[k] = v
-            with self._lock:
-                self._version += 1
+                with self._lock:
+                    for k, v in data.items():
+                        if k in DEFAULTS and self._data.get(k) != v:
+                            self._data[k] = v
+                            changed = True
+                    if changed:
+                        self._version += 1
         except FileNotFoundError:
             pass
         except Exception as exc:
             self.load_error = str(exc)
             self.save_error = "配置文件读取失败（已用默认值）：%s" % exc
+        return changed
 
     def save(self):
         with self._lock:

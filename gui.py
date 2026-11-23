@@ -20,7 +20,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 SIDE_W = 192
 
@@ -30,11 +30,12 @@ NAV = [("loudness", "响度均衡"), ("mute", "自动静音"),
 METER_LO, METER_HI = -45.0, -5.0
 
 # 音量均衡预设：一次把「目标 + 范围 + 上限 + 跟随快慢」整套设好。
-# 顺序即界面顺序；None = 自定义（不写入任何值，只用来显示状态）。
-# 判定逻辑：配置里的每一项都和某组预设一致，才算选中该预设，否则显示「自定义」。
+# 顺序即界面顺序；None = 自定义（不写入任何值，只记录"当前是手动模式"）。
+# 判定逻辑：配置里的 loud_preset 说了算（预设名 / "custom"）；老配置没这个键时
+# 才按数值反推，保证从旧版本升级上来的人看到的还是原来那一档。
 LOUD_PRESETS = [
     ("自定义", None,
-     "当前是手动设置，下面各项自己调。"),
+     "手动模式：下面各项自己调；点上面任意预设可一键套用。"),
     ("人声", {"enabled": True, "level_mode": "auto",
               "target_lufs": -16.0, "target_range_db": 3.0,
               "max_boost_db": 15.0, "max_attenuation_db": 20.0,
@@ -57,10 +58,22 @@ LOUD_PRESETS = [
      "夜间 / 游戏：把动态压扁，音量不大也什么都听得见（目标 −23 LUFS）。"),
 ]
 
+# 参与「预设是否还成立」判定的键。enabled 不算：它是总开关，
+# 关掉均衡不该让预设高亮跳到「自定义」；其余五个就是预设真正定义的东西。
+PRESET_KEYS = ("level_mode", "target_lufs", "target_range_db",
+               "max_boost_db", "max_attenuation_db",
+               "gain_attack_ms", "gain_release_ms")
+
 
 
 def _fmt_db(v):
     return "关闭" if v <= -39.5 else "%+.1f dB" % v
+
+
+def _latency_ms(block_ms):
+    """端到端延迟估算，与引擎口径一致：采集/队列 2 块 + 设备缓冲（两块+6ms，下限 24）。"""
+    block_ms = float(block_ms)
+    return block_ms * 2 + max(24.0, block_ms * 2 + 6)
 
 
 def _fmt_lufs(v):
@@ -92,9 +105,14 @@ class AppWindow:
         self._btn_save = None
         self._tip_text = None      # 当前悬停的说明文字
         self._tip_ids = []         # 气泡的 canvas item（重建页面时清掉）
+        self._foot_hold = None     # 状态栏临时提示 (文字, 颜色, 截止时间)
         self._live = {}            # 实时数值的「上次显示值」，没变就不重绘
         self.meter = None
         self.m_band = None
+        self.m_preset_seg = None   # 预设分段控件（改数值时要即时把高亮挪到「自定义」）
+        self.m_preset_desc = None
+        self.m_lat = None          # 设备页「当前端到端延迟」
+        self.m_lufs = self.m_gain = self.m_mode = self.m_mark = None
         self._glass_raw = None
         self._img_body = None
         self._img_side = None
@@ -446,11 +464,18 @@ class AppWindow:
     def _render_footer(self, p, x, w, H):
         pal = self.pal
         y = H - 52
-        p.cv.create_line(x, y - 10, x + w, y - 10, fill=pal["line"])
+        line = p.cv.create_line(x, y - 10, x + w, y - 10, fill=pal["line"])
         self._foot = p.cv.create_text(x, y + 16, text="", anchor="w",
                                       font=(FONT, 9), fill=pal["sub"], tags="foot")
         self._btn_save = p.button(x + w - 106, y - 3, 106, 34, "已保存",
                                   self._save_now, kind="primary", size=10)
+        # 分隔线和保存按钮打上 chrome 标记：内容区做越界检查时要排除它们
+        try:
+            p.cv.itemconfigure(line, tags="chrome")
+            p.cv.itemconfigure(self._btn_save.img, tags="chrome")
+            p.cv.itemconfigure(self._btn_save.label, tags="chrome")
+        except Exception:
+            pass
         self._refresh_save()
 
     def _goto(self, key):
@@ -469,15 +494,15 @@ class AppWindow:
         p.text(x, y + 34, "把声音拉进目标范围：偏小的提上来，偏大的压下去", 10, pal["sub"])
 
         # --- 当前响度 ---
-        cy = y + 62
-        p.card(x, cy, w, 104)
-        p.text(x + 22, cy + 22, "当前响度", 10, pal["sub"])
-        self.m_lufs = p.text(x + 22, cy + 56, "—", 22, bold=True)
-        p.text(x + 22 + 118, cy + 60, "LUFS", 9, pal["dim"])
-        self.m_gain = p.text(x + w - 24, cy + 22, "增益 —", 10, pal["sub"], anchor="e")
-        self.m_mode = p.text(x + w - 24, cy + 43, "—", 9, pal["dim"], anchor="e")
+        cy = y + 58
+        p.card(x, cy, w, 100)
+        p.text(x + 22, cy + 20, "当前响度", 10, pal["sub"])
+        self.m_lufs = p.text(x + 22, cy + 54, "—", 22, bold=True)
+        p.text(x + 22 + 118, cy + 58, "LUFS", 9, pal["dim"])
+        self.m_gain = p.text(x + w - 24, cy + 20, "增益 —", 10, pal["sub"], anchor="e")
+        self.m_mode = p.text(x + w - 24, cy + 41, "—", 9, pal["dim"], anchor="e")
 
-        mx0, mx1, my = x + 196, x + w - 24, cy + 56
+        mx0, mx1, my = x + 196, x + w - 24, cy + 54
         self.meter = (mx0, mx1, my)
         ui_kit.shape(p.cv, mx0, my - 3, mx1 - mx0, 6, 3, fill=pal["track"])
         self.m_band = None
@@ -489,70 +514,72 @@ class AppWindow:
         p.text(mx1, my + 22, "−5", 8, pal["dim"], anchor="e")
 
         # --- 音量均衡预设 ---
-        py = cy + 116
-        p.card(x, py, w, 94)
-        p.section(x + 22, py + 24, "音量均衡预设",
+        py = cy + 112
+        p.card(x, py, w, 92)
+        p.section(x + 22, py + 22, "音量均衡预设",
                   tip="一次设好目标响度、范围、上限和跟随快慢；"
-                      "之后手动微调会变成「自定义」。")
+                      "选好之后手动微调任何一项，会自动切到「自定义」。")
         idx = self._preset_index()
-        p.segment(x + 22, py + 38, w - 44, 30,
-                  [n for n, _s, _d in LOUD_PRESETS], idx, self._on_preset)
-        p.text(x + 22, py + 80, LOUD_PRESETS[idx][2], 9, pal["sub"], width=w - 44)
+        self.m_preset_seg = p.segment(x + 22, py + 34, w - 44, 30,
+                                      [n for n, _s, _d in LOUD_PRESETS], idx,
+                                      self._on_preset)
+        self.m_preset_desc = p.text(x + 22, py + 72, LOUD_PRESETS[idx][2], 9,
+                                    pal["sub"], width=w - 44)
 
         # --- 处理方式 ---
-        by = py + 106
-        p.card(x, by, w, 214)
-        p.section(x + 22, by + 26, "处理方式",
+        by = py + 102
+        p.card(x, by, w, 206)
+        p.section(x + 22, by + 24, "处理方式",
                   tip="自动电平：低于目标就提、高于目标就压，让声音一直待在目标附近；"
                       "仅限制：只压过响的部分，安静内容原样通过（不放大底噪）。")
-        p.segment(x + 22, by + 50, 236, 34, ["仅限制", "自动电平"],
+        p.segment(x + 22, by + 46, 236, 34, ["仅限制", "自动电平"],
                   1 if auto else 0, self._on_mode)
-        p.text(x + w - 96, by + 58, "启用均衡", 10, pal["sub"], anchor="e")
-        p.help(x + w - 84, by + 58,
+        p.text(x + w - 96, by + 50, "启用均衡", 10, pal["sub"], anchor="e")
+        p.help(x + w - 84, by + 50,
                "关掉后不做任何电平调整，只按音量/直通处理；自动静音不受影响。")
-        p.toggle(x + w - 24 - 46, by + 54, lambda: bool(cfg.get("enabled", True)),
+        p.toggle(x + w - 24 - 46, by + 46, lambda: bool(cfg.get("enabled", True)),
                  self._on_enabled)
         desc = ("自动电平：低于范围就提上来、高于范围就压下去，落在范围内不动，"
                 "让声音一直待在目标附近（最多提升 +%.0fdB）。"
                 % float(cfg.get("max_boost_db", 12))
                 if auto else
                 "仅限制：只把超过目标的部分压下来，安静的内容原样通过（不会放大底噪）。")
-        p.text(x + 22, by + 94, desc, 9, pal["sub"], width=w - 44, anchor="nw")
+        p.text(x + 22, by + 88, desc, 9, pal["sub"], width=w - 44, anchor="nw")
 
         col = (w - 44 - 26) / 2.0
-        p.field(x + 22, by + 150, col, "目标响度", float(cfg.get("target_lufs", -18)),
+        p.field(x + 22, by + 142, col, "目标响度", float(cfg.get("target_lufs", -18)),
                 -30, -8, 0.5, self._on_target, fmt=lambda v: "%.1f LUFS" % v,
                 tip="希望听到的平均响度。−18 LUFS ≈ 常见视频的正常音量；数字越小越响。")
-        p.field(x + 22 + col + 26, by + 150, col, "目标范围 ±",
+        p.field(x + 22 + col + 26, by + 142, col, "目标范围 ±",
                 float(cfg.get("target_range_db", 3)), 0, 8, 0.5, self._on_range,
                 fmt=lambda v: "±%.1f dB" % v, disabled=not auto,
                 note="" if auto else "仅自动电平",
                 tip="允许的偏差带。落在目标附近这个范围内就不动手，避免一直微调导致的「呼吸感」。")
 
         # --- 限制与余量 ---
-        ly = by + 226
-        p.card(x, ly, w, 186)
-        p.section(x + 22, ly + 26, "限制与余量",
+        ly = by + 214
+        p.card(x, ly, w, 178)
+        p.section(x + 22, ly + 24, "限制与余量",
                   tip="这几项是安全边界：决定最多能提升/衰减多少，以及输出峰值的天花板。")
-        p.field(x + 22, ly + 52, col, "最大衰减",
+        p.field(x + 22, ly + 46, col, "最大衰减",
                 float(cfg.get("max_attenuation_db", 20)), 0, 36, 1,
                 self._on_maxatt, fmt=lambda v: "−%.0f dB" % v,
                 tip="最多把响的部分压下去多少 dB。小一点更保动态，大一点更平。")
-        p.field(x + 22 + col + 26, ly + 52, col, "最大提升",
+        p.field(x + 22 + col + 26, ly + 46, col, "最大提升",
                 float(cfg.get("max_boost_db", 12)), 0, 24, 1,
                 self._on_maxboost, fmt=lambda v: "+%.0f dB" % v,
                 disabled=not auto, note="" if auto else "仅自动电平",
                 tip="最多把安静的部分提上来多少 dB。提得越多，底噪也一起被放大。")
-        p.field(x + 22, ly + 108, col, "限幅上限",
+        p.field(x + 22, ly + 98, col, "限幅上限",
                 float(cfg.get("limiter_ceiling_db", -1)), -6, 0, 0.5,
                 self._on_ceiling, fmt=lambda v: "%.1f dBFS" % v,
                 tip="输出的绝对上限。0 是数字满刻度，留 −1 dB 给重采样/编码的余量。")
-        p.field(x + 22 + col + 26, ly + 108, col, "处理前降低",
+        p.field(x + 22 + col + 26, ly + 98, col, "处理前降低",
                 float(cfg.get("pre_gain_db", 0)), -24, 0, 1,
                 self._on_pre, fmt=lambda v: "%+.0f dB" % v,
                 tip="整体先降这么多再处理：等于把音量基准放低，同时给限幅器留更多余量。")
-        p.text(x + 22, ly + 162, "直通：完全不做处理，只把声音原样送到耳机", 9, pal["sub"])
-        p.toggle(x + w - 24 - 46, ly + 154,
+        p.text(x + 22, ly + 150, "直通：完全不做处理，只把声音原样送到耳机", 9, pal["sub"])
+        p.toggle(x + w - 24 - 46, ly + 142,
                  lambda: bool(cfg.get("passthrough", False)), self._on_passthrough)
 
     def _page_mute(self, p, x, y, w, H):
@@ -631,90 +658,90 @@ class AppWindow:
         p.text(x, y + 6, "音频设备", 18, bold=True)
         p.text(x, y + 34, "声音从 CABLE 虚拟声卡进来，处理后送到耳机", 10, pal["sub"])
 
-        cy = y + 62
-        p.card(x, cy, w, 232)
-        p.section(x + 22, cy + 24, "设备", "改完立即重连（约 0.2 秒静音）", right=x + w - 22)
+        cy = y + 58
+        p.card(x, cy, w, 212)
+        p.section(x + 22, cy + 22, "设备", "改完立即重连（约 0.2 秒静音）", right=x + w - 22)
 
-        p.text(x + 22, cy + 68, "监听输入", 10, pal["sub"])
-        p.help(x + 22 + ui_kit.text_width("监听输入", 10) + 12, cy + 68,
+        p.text(x + 22, cy + 62, "监听输入", 10, pal["sub"])
+        p.help(x + 22 + ui_kit.text_width("监听输入", 10) + 12, cy + 62,
                "从哪里采集声音。一般是 CABLE：系统默认输出指向它，所有程序的声音都会经过它。")
         cb1 = ttk.Combobox(p.cv, textvariable=self.var_input,
                            values=[""] + self._inputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
         cb1.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
-        p.cv.create_window(x + 132, cy + 60, window=cb1, anchor="nw",
+        p.cv.create_window(x + 132, cy + 56, window=cb1, anchor="nw",
                            width=w - 176, height=30)
 
-        p.text(x + 22, cy + 122, "输出设备", 10, pal["sub"])
-        p.help(x + 22 + ui_kit.text_width("输出设备", 10) + 12, cy + 122,
+        p.text(x + 22, cy + 106, "输出设备", 10, pal["sub"])
+        p.help(x + 22 + ui_kit.text_width("输出设备", 10) + 12, cy + 106,
                "处理完送到哪个设备，通常是你的耳机/音箱。")
         cb2 = ttk.Combobox(p.cv, textvariable=self.var_output,
                            values=[""] + self._outputs, state="readonly",
                            style="Acrylic.TCombobox", font=(FONT, 10))
         cb2.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
-        p.cv.create_window(x + 132, cy + 114, window=cb2, anchor="nw",
+        p.cv.create_window(x + 132, cy + 100, window=cb2, anchor="nw",
                            width=w - 176, height=30)
 
         blk = float(cfg.get("block_ms", 15))
-        p.field(x + 22, cy + 164, w - 44, "缓冲（越小延迟越低；10ms 已很稳）",
+        p.field(x + 22, cy + 142, w - 44, "缓冲（越小延迟越低；10ms 已很稳）",
                 blk, 10, 100, 1, self._on_block, fmt=lambda v: "%.0f ms" % v,
                 tip="每块处理的时长：越小延迟越低，但越依赖设备缓冲去挡线程抖动。11–15 ms 兼顾跟手和稳定。")
-        p.text(x + 22, cy + 212,
-               "当前端到端延迟约 %.0f ms（采集/队列 2 块 + 设备缓冲）"
-               % (blk * 2 + max(24, blk * 2 + 6)),
-               8, pal["dim"])
+        self.m_lat = p.text(x + 22, cy + 192,
+                            "当前端到端延迟约 %.0f ms（采集/队列 2 块 + 设备缓冲）"
+                            % _latency_ms(blk),
+                            8, pal["dim"])
 
-        ty = cy + 244
-        p.card(x, ty, w, 180)
-        p.text(x + 22, ty + 26, "自动接管系统默认输出", 11, bold=True)
-        p.help(x + 22 + ui_kit.text_width("自动接管系统默认输出", 11, True) + 12, ty + 26,
+        ty = cy + 222
+        p.card(x, ty, w, 158)
+        p.text(x + 22, ty + 22, "自动接管系统默认输出", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("自动接管系统默认输出", 11, True) + 12, ty + 22,
                "你在系统里把默认输出点到耳机时，本程序自动把耳机设为输出设备，"
                "再把系统默认改回虚拟声卡——声音不断，下次换耳机再点一下就行。")
-        p.toggle(x + w - 24 - 46, ty + 20, lambda: bool(cfg.get("auto_follow_default", True)),
+        p.toggle(x + w - 24 - 46, ty + 16, lambda: bool(cfg.get("auto_follow_default", True)),
                  self._on_follow)
-        p.text(x + 22, ty + 52,
+        p.text(x + 22, ty + 46,
                "系统里把默认输出点成耳机时，自动把它设为输出设备，再把系统默认改回虚拟声卡。",
                9, pal["sub"], width=w - 48, anchor="nw")
-        p.divider(x + 22, ty + 78, w - 44)
-        p.text(x + 22, ty + 96, "在远程桌面中接管", 11, bold=True)
-        p.help(x + 22 + ui_kit.text_width("在远程桌面中接管", 11, True) + 12, ty + 96,
+        p.divider(x + 22, ty + 70, w - 44)
+        p.text(x + 22, ty + 88, "在远程桌面中接管", 11, bold=True)
+        p.help(x + 22 + ui_kit.text_width("在远程桌面中接管", 11, True) + 12, ty + 88,
                "关掉（默认）：远程桌面会话里本程序完全不碰声音——不处理响度、不改默认输出，"
                "声音直接送到对面的设备；打开：远程桌面里也像本机一样接管（需要把默认输出改成 CABLE）。")
-        p.toggle(x + w - 24 - 46, ty + 90,
+        p.toggle(x + w - 24 - 46, ty + 82,
                  lambda: bool(cfg.get("rdp_takeover", False)), self._on_rdp)
-        p.text(x + 22, ty + 118,
+        p.text(x + 22, ty + 110,
                "关闭时远程桌面里不处理声音、也不改系统默认输出。",
                9, pal["sub"], width=w - 48, anchor="nw")
-        self.m_default = p.text(x + 22, ty + 152, "系统默认输出：—", 9, pal["dim"])
+        self.m_default = p.text(x + 22, ty + 140, "系统默认输出：—", 9, pal["dim"])
 
-        vc = ty + 192
-        p.card(x, vc, w, 168)
-        p.text(x + 22, vc + 26, "用 Windows 音量滑块控制声音大小", 11, bold=True)
+        vc = ty + 170
+        p.card(x, vc, w, 162)
+        p.text(x + 22, vc + 22, "用 Windows 音量滑块控制声音大小", 11, bold=True)
         p.help(x + 22 + ui_kit.text_width("用 Windows 音量滑块控制声音大小", 11, True) + 12,
-               vc + 26,
+               vc + 22,
                "引擎只读系统音量滑块的值当输出增益，绝不修改你的滑块。关掉则完全按内部增益输出。")
-        p.text(x + 22, vc + 50,
+        p.text(x + 22, vc + 46,
                "系统音量里「CABLE In 16ch」的滑块即为最终音量，引擎主动读它当输出增益。",
                9, pal["sub"], width=w - 60)
-        p.toggle(x + w - 24 - 46, vc + 20,
+        p.toggle(x + w - 24 - 46, vc + 16,
                  lambda: bool(cfg.get("use_windows_volume", True)), self._on_winvol)
 
         col = (w - 44 - 26) / 2.0
-        p.field(x + 22, vc + 78, col, "正常音量位置",
+        p.field(x + 22, vc + 68, col, "正常音量位置",
                 float(cfg.get("winvol_ref", 0.20)) * 100, 5, 60, 1,
                 self._on_winvol_ref, fmt=lambda v: "%.0f%%" % v,
                 note="此处=标准音量",
                 tip="滑块停在这个位置时输出 0 dB（标准音量）。习惯把音量拉得很低的话，把它调小。")
-        p.field(x + 22 + col + 26, vc + 78, col, "最大增益",
+        p.field(x + 22 + col + 26, vc + 68, col, "最大增益",
                 float(cfg.get("winvol_max_db", 10.0)), 0, 20, 0.5,
                 self._on_winvol_max, fmt=lambda v: "+%.1f dB" % v,
                 note="100% 时",
                 tip="滑块拉到 100% 时额外增加多少 dB。加太多会让软限幅一直在工作，听感发毛。")
-        p.text(x + 22, vc + 138,
+        p.text(x + 22, vc + 132,
                "默认 20% = 正常音量，100% = +10dB；觉得整体偏大/偏小就调上面两项。",
                9, pal["dim"], width=w - 44)
 
-        by = vc + 180
+        by = vc + 172
         p.button(x + 22, by, 96, 34, "重新扫描", self._rescan_click, kind="ghost")
         p.button(x + 126, by, 116, 34, "应用并重连", self._apply_device)
         # 提示放按钮同一行右侧，不额外占高度，避免和底部状态栏重叠
@@ -759,8 +786,7 @@ class AppWindow:
                width=w - 48, anchor="nw")
         p.text(x + 24, cy + 422,
                "端到端延迟默认约 %d ms，可在「音频设备」里用缓冲滑块调节"
-               % int(float(self.config.get("block_ms", 15)) * 2
-                     + max(24, float(self.config.get("block_ms", 15)) * 2 + 6)),
+               % int(_latency_ms(self.config.get("block_ms", 15))),
                9, pal["dim"])
 
     # ---------------------------------------------------------------- 实时刷新
@@ -828,6 +854,13 @@ class AppWindow:
             self._set_foot("等待声音进入 CABLE：在 Windows 里播放任意声音即可开始", pal["warn"])
         else:
             self._set_foot("设置修改后立即生效并自动保存", pal["dim"])
+        # 临时提示优先显示几秒（否则上面这行会立刻把它盖掉）
+        hold = getattr(self, "_foot_hold", None)
+        if hold is not None:
+            if time.time() < hold[2]:
+                self._set_foot(hold[0], hold[1])
+            else:
+                self._foot_hold = None
         self._refresh_save()
         if self.page == "device":
             self._update_default_label()
@@ -864,7 +897,11 @@ class AppWindow:
         except Exception:
             pass
 
-    def _set_foot(self, text, color):
+    def _set_foot(self, text, color, hold=0.0):
+        if hold:
+            # 临时提示（"已应用…"）：状态栏每 220ms 会被实时数值改写，
+            # 不留一会儿的话用户根本看不到。
+            self._foot_hold = (text, color, time.time() + float(hold))
         if self._live.get("foot") == (text, color):
             return
         self._live["foot"] = (text, color)
@@ -906,6 +943,11 @@ class AppWindow:
                 elif cmd == "quit":
                     self.quit()
                     return
+                elif cmd == "refresh":
+                    # 外部（托盘 / 设备守护）改了配置：整页重画一次把开关、数值同步过来。
+                    # 正在拖控件时先跳过，等松手后的下一轮再说，免得把控件拆掉。
+                    if self._active is None:
+                        self.render()
         except Exception:
             pass
         # 主题检查降频：读注册表每 220ms 一次没必要，2 秒足够跟手
@@ -953,42 +995,85 @@ class AppWindow:
 
     # ---------------------------------------------------------------- 回调
     def _set(self, key, value):
+        old = self.config.get(key, None)
         self.config.set(key, value)
+        # 手动改了预设定义里的任何一项 → 这一档不再"成立"，立刻切到「自定义」。
+        # 只挪高亮和说明文字，不整页重绘：拖滑块时重建页面会把正在拖的控件拆掉。
+        if key in PRESET_KEYS and old != value:
+            self._mark_preset_custom()
         self._mark_change()
 
     # ---- 音量均衡预设 ----
-    def _preset_index(self):
-        """配置和哪一组预设完全一致就返回它的下标，否则 0（自定义）。"""
+    def _preset_values_match(self, spec):
+        """配置里的值与某组预设是否一致（忽略总开关 enabled）。"""
+        if not spec:
+            return False
         cfg = self.config
-        for i, (_name, spec, _desc) in enumerate(LOUD_PRESETS):
-            if not spec:
+        for k in PRESET_KEYS:
+            if k not in spec:
                 continue
-            ok = True
-            for k, want in spec.items():
-                cur = cfg.get(k, None)
-                if isinstance(want, bool):
-                    ok = bool(cur) == want
-                elif isinstance(want, str):
-                    ok = str(cur) == want
-                else:
-                    try:
-                        ok = abs(float(cur) - float(want)) <= 1e-6
-                    except (TypeError, ValueError):
-                        ok = False
-                if not ok:
-                    break
-            if ok:
+            want, cur = spec[k], cfg.get(k, None)
+            if isinstance(want, str):
+                if str(cur) != want:
+                    return False
+            else:
+                try:
+                    if abs(float(cur) - float(want)) > 1e-6:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        return True
+
+    def _preset_index(self):
+        """当前该高亮哪一档。
+
+        以配置里的 loud_preset 为准（预设名 / "custom"）；早先的配置没有这个键，
+        退化成按数值反推，保证升级上来的用户看到的还是原来那一档。
+        """
+        cfg = self.config
+        sel = str(cfg.get("loud_preset", "") or "")
+        if sel == "custom":
+            return 0
+        for i, (name, spec, _desc) in enumerate(LOUD_PRESETS):
+            if name == sel:
+                return i if self._preset_values_match(spec) else 0
+        if sel:                      # 预设列表改过 / 名字不认识
+            return 0
+        for i, (_name, spec, _desc) in enumerate(LOUD_PRESETS):
+            if self._preset_values_match(spec):
                 return i
         return 0
 
+    def _mark_preset_custom(self):
+        """手动微调后把状态切到「自定义」（值本身不动）。"""
+        if str(self.config.get("loud_preset", "") or "") == "custom":
+            return
+        self.config.set("loud_preset", "custom")
+        seg = self.m_preset_seg
+        if seg is not None:
+            try:
+                seg.index = 0
+                seg._place()
+            except Exception:
+                pass
+        if self.m_preset_desc is not None and self._painter is not None:
+            try:
+                self._painter.cv.itemconfigure(self.m_preset_desc,
+                                               text=LOUD_PRESETS[0][2])
+            except Exception:
+                pass
+
     def _on_preset(self, i):
-        spec = LOUD_PRESETS[i][1]
+        name, spec, _desc = LOUD_PRESETS[i]
         if spec:
             for k, v in spec.items():
                 self.config.set(k, v)
-            self._mark_change()
-        # 「自定义」不写任何值；无论如何都重绘一次，让高亮回到真实状态
-        # （否则点了「自定义」会停在自定义上，但参数还是原来那组）
+            self.config.set("loud_preset", name)
+        else:
+            # 「自定义」= 显式的"我不跟预设"，不写任何参数，但要记住这个选择
+            self.config.set("loud_preset", "custom")
+        self._mark_change()
+        # 重画一次把各字段的数值/禁用态刷新到新预设（延后到本事件处理完再重建）
         self.root.after(10, self.render)
 
     def _on_enabled(self, v):
@@ -1046,7 +1131,7 @@ class AppWindow:
         self._set("rdp_takeover", bool(v))
         self._set_foot("远程桌面中也会接管声音" if v else
                        "远程桌面中不再接管声音（声音原样直通）",
-                       self.pal["sub"])
+                       self.pal["sub"], hold=3.0)
 
     def _on_winvol(self, v):
         self._set("use_windows_volume", bool(v))
@@ -1062,11 +1147,20 @@ class AppWindow:
         ok = autostart.set_enabled(bool(on))
         self._set_foot("开机自启已开启" if ok and on else
                        ("开机自启已关闭" if ok else "开机自启设置失败"),
-                       self.pal["sub"] if ok else self.pal["err"])
+                       self.pal["sub"] if ok else self.pal["err"], hold=4.0)
 
     def _on_block(self, v):
         """缓冲改动要重建会话才生效；拖动时别每格都重连，停手 0.6 秒再应用。"""
         self._set("block_ms", float(v))
+        # 延迟估算就写在滑块下面，拖的时候不跟着变会让人以为没生效
+        if self.m_lat is not None and self._painter is not None:
+            try:
+                self._painter.cv.itemconfigure(
+                    self.m_lat,
+                    text="当前端到端延迟约 %.0f ms（采集/队列 2 块 + 设备缓冲）"
+                         % _latency_ms(float(v)))
+            except Exception:
+                pass
         job = getattr(self, "_block_job", None)
         if job:
             try:
@@ -1078,7 +1172,7 @@ class AppWindow:
     def _apply_block(self):
         self._block_job = None
         self.engine.request_reload()
-        self._set_foot("已应用缓冲设置，正在重连…", self.pal["warn"])
+        self._set_foot("已应用缓冲设置，正在重连…", self.pal["warn"], hold=4.0)
 
     # ---- 名单 ----
     def _fill_list(self):
@@ -1149,13 +1243,20 @@ class AppWindow:
             self.render()
 
     def _apply_device(self):
+        new_in = self.var_input.get()
+        new_out = self.var_output.get()
+        if (new_in == (self.config.get("input_device", "") or "")
+                and new_out == (self.config.get("output_device", "") or "")):
+            # 选的是同一个设备：没必要白白断一次声音
+            self._set_foot("设备没有变化", self.pal["sub"], hold=2.0)
+            return
         self.config.update({
-            "input_device": self.var_input.get(),
-            "output_device": self.var_output.get(),
+            "input_device": new_in,
+            "output_device": new_out,
         })
         self.engine.request_reload()
         self._mark_change()
-        self._set_foot("已应用设备设置，正在重连…", self.pal["warn"])
+        self._set_foot("已应用设备设置，正在重连…", self.pal["warn"], hold=4.0)
 
     # ---------------------------------------------------------------- 窗口
     def show(self):

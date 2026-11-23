@@ -230,10 +230,13 @@ class Segment:
     def _press(self, x, *_):
         i = int((x - self.x - 3) // max(self.slot, 1))
         i = max(0, min(self.n - 1, i))
-        if i != self.index:
-            self.index = i
+        changed = i != self.index
+        self.index = i
+        if changed:
             self._place()
-            self.on_pick(i)
+        # 即便点的是当前已选中的那一项也要回调：预设被数值反推显示成"已选中"、
+        # 用户手动改过参数后点回来想恢复原值，不回调就永远点不动。
+        self.on_pick(i)
         return True
 
 

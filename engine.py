@@ -811,9 +811,13 @@ class Engine:
                         state["win_vol"] = vol_scalar
 
                         if bool(cfg.get("passthrough", False)):
-                            # 直通：完全不处理，原样搬运（排查 / 只要自动静音时用）
+                            # 直通：不做电平调整，原样搬运（排查 / 只要自动静音时用）。
+                            # 但音量与前级仍可能把信号推过满刻度，所以仍过一遍 0 dBFS
+                            # 软膝：低于 0.8 FS 一个采样都不动，超过才平滑压住，
+                            # 比让驱动硬削波干净得多。
                             state["gain"] = 0.0
                             y = apply_gain_ramp(x, pre * vol_gain, state)
+                            y = soft_limit(y, 0.0)
                         else:
                             gate = self._num(cfg, "silence_gate_lufs", -60, -90, -20)
                             enabled = bool(cfg.get("enabled", True))

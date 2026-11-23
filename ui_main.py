@@ -94,9 +94,16 @@ def _watch_status(status_engine, muter, guard, config, cmds):
         try:
             mtime = os.path.getmtime(config.path)
             if mtime != last_mtime:
-                if last_mtime:
-                    config.load()
-                last_mtime = mtime
+                # 自己还有没落盘的改动时先别重载：否则用户刚拖的滑块会被
+                # 核心进程写出的旧值盖掉（等它保存完下一轮再同步）。
+                if last_mtime and not config.is_dirty():
+                    # 托盘/设备守护改了配置（比如勾掉响度均衡）→ 让界面重画一次，
+                    # 否则开关状态会一直停着旧样子，直到下次切页。
+                    if config.load():
+                        cmds.put("refresh")
+                    last_mtime = mtime
+                elif not last_mtime:
+                    last_mtime = mtime
         except Exception:
             pass
         time.sleep(0.25)

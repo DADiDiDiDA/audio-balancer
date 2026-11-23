@@ -16,7 +16,8 @@
 """
 import ctypes
 import time
-from ctypes import POINTER, Structure, byref, c_int, c_int64, c_uint32, c_void_p
+from ctypes import (POINTER, Structure, byref, c_int, c_int64, c_uint16,
+                    c_uint32, c_void_p)
 
 import numpy as np
 from comtypes import COMMETHOD, CLSCTX_ALL, GUID, HRESULT, IUnknown
@@ -27,6 +28,29 @@ AUDCLNT_STREAMOPTIONS_RAW = 0x2
 AUDIO_STREAM_CATEGORY_MEDIA = 11
 REFTIMES_PER_SEC = 10_000_000
 BUFFER_MS = 200
+WAVE_FORMAT_IEEE_FLOAT = 3
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+
+class WAVEFORMATEX(Structure):
+    # Windows 头文件里这两个结构都是 pack(1)：WAVEFORMATEX 正好 18 字节。
+    # 不打包的话 ctypes 会按 4 字节对齐补 2 字节，后面 SubFormat 就整体错位。
+    _pack_ = 1
+    _fields_ = [("wFormatTag", c_uint16),
+                ("nChannels", c_uint16),
+                ("nSamplesPerSec", c_uint32),
+                ("nAvgBytesPerSec", c_uint32),
+                ("nBlockAlign", c_uint16),
+                ("wBitsPerSample", c_uint16),
+                ("cbSize", c_uint16)]
+
+
+class WAVEFORMATEXTENSIBLE(Structure):
+    _pack_ = 1
+    _fields_ = [("Format", WAVEFORMATEX),
+                ("wValidBitsPerSample", c_uint16),
+                ("dwChannelMask", c_uint32),
+                ("SubFormat", ctypes.c_ubyte * 16)]
 
 
 class AudioClientProperties(Structure):
@@ -107,6 +131,23 @@ def _find_device(name):
     return candidates[0] if candidates else None
 
 
+# KSDATAFORMAT_SUBTYPE_IEEE_FLOAT：{00000003-0000-0010-8000-00AA00389B71}
+_FLOAT_SUBFORMAT = bytes([0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+                          0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+
+
+def describe_mix_format(pf):
+    """读取 WAVEFORMATEX，返回 (是否 float32, 声道数, 采样率, 位深, formatTag)。"""
+    fmt = ctypes.cast(pf, POINTER(WAVEFORMATEX)).contents
+    tag = int(fmt.wFormatTag)
+    is_float = tag == WAVE_FORMAT_IEEE_FLOAT
+    if tag == WAVE_FORMAT_EXTENSIBLE and int(fmt.cbSize) >= 22:
+        ext = ctypes.cast(pf, POINTER(WAVEFORMATEXTENSIBLE)).contents
+        is_float = bytes(ext.SubFormat) == _FLOAT_SUBFORMAT
+    return (is_float, int(fmt.nChannels), int(fmt.nSamplesPerSec),
+            int(fmt.wBitsPerSample), tag)
+
+
 class RawPlayer:
     """最小可用的 RAW 播放器：只支持 2 声道 float32，格式取设备混音格式。"""
 
@@ -120,6 +161,7 @@ class RawPlayer:
         self._bufsize = 0
         self._started = False
         self.used_raw = False
+        self.mix_format = None      # (is_float, channels, rate, bits, tag)
         # 欠载诊断：starves = 进 play() 时缓冲已空（真的欠载）；min_pad_ms = 入口最小剩余
         self.starves = 0
         self.writes = 0
@@ -145,10 +187,25 @@ class RawPlayer:
             self.used_raw = False
 
         pf = client.GetMixFormat()
-        hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED,
-                               AUDCLNT_STREAMFLAGS_NOPERSIST,
-                               self.buffer_ms * (REFTIMES_PER_SEC // 1000),
-                               0, pf, None)
+        try:
+            is_float, ch, rate, bits, tag = describe_mix_format(pf)
+            self.mix_format = (is_float, ch, rate, bits, tag)
+            # 我们只按 float32 / 立体声 / 48k 写裸内存。设备混音格式对不上就直接放弃
+            # RAW（交给 soundcard 共享模式做转换）：以前不检查，遇到 24bit 或 6 声道
+            # 的端点会把一块 float32 直接塞进去 —— 声音变调、变噪。
+            if not is_float or bits != 32 or ch != self.channels or rate != self.samplerate:
+                raise RuntimeError(
+                    "混音格式不适合 RAW 直写（%.0f/%.0f bit/%d Hz/%d ch）"
+                    % (float(is_float), bits, rate, ch))
+            hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                   AUDCLNT_STREAMFLAGS_NOPERSIST,
+                                   self.buffer_ms * (REFTIMES_PER_SEC // 1000),
+                                   0, pf, None)
+        finally:
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(pf)
+            except Exception:
+                pass
         if hr != 0:
             raise RuntimeError("Initialize 失败：0x%08X" % (hr + 2 ** 32))
 
