@@ -59,6 +59,27 @@ check(float(np.max(np.abs(np.diff(y, axis=0)))) < 0.2,
 quiet = (0.3 * np.sin(x))[:, None]
 check(np.array_equal(E.soft_limit(quiet, 0.0), quiet), "低于膝点的信号一个采样都不改")
 
+print("--- 2b) 低电平拐点：弱信号不放大 ---")
+# 目标 -18、拐点 -52（目标-34）、过渡 10dB
+g_loud = E.desired_gain("auto", -18.0, 3.0, -20.0, 20.0, 12.0,
+                        low_knee=-52.0, knee_width=10.0)
+g_mid = E.desired_gain("auto", -18.0, 3.0, -47.0, 20.0, 12.0,
+                       low_knee=-52.0, knee_width=10.0)
+g_mid_no_knee = E.desired_gain("auto", -18.0, 3.0, -47.0, 20.0, 12.0)
+g_quiet = E.desired_gain("auto", -18.0, 3.0, -56.0, 20.0, 12.0,
+                         low_knee=-52.0, knee_width=10.0)
+g_att = E.desired_gain("auto", -18.0, 3.0, -6.0, 20.0, 12.0,
+                       low_knee=-52.0, knee_width=10.0)
+print("  −20 LUFS → %+.1f dB；−47 → %+.1f dB；−56 → %+.1f dB；过响 −6 → %+.1f dB"
+      % (g_loud, g_mid, g_quiet, g_att))
+check(g_loud > 0.0, "正常内容的提升不受影响")
+check(abs(g_mid - g_mid_no_knee * 0.5) < 0.2,
+      "过渡带里的提升按比例削弱（%+.1f dB，满额 %+.1f dB）" % (g_mid, g_mid_no_knee))
+check(abs(g_quiet) < 1e-9, "拐点以下完全不给提升（护底噪）")
+check(g_att < 0.0, "过响内容照常衰减（拐点只管提升）")
+g_off = E.desired_gain("auto", -18.0, 3.0, -56.0, 20.0, 12.0)
+check(g_off > 0.0, "不传拐点时保持旧行为（可关闭）")
+
 print("--- 3) 端到端：响度/增益/失真 ---")
 cfg = Config(path=os.path.join(tempfile.mkdtemp(), "t.json"))
 cfg.update({"block_ms": 10.0, "downmix": True, "use_windows_volume": True,

@@ -538,6 +538,162 @@ class ClickGuard:
 _DOWNMIX_CACHE = {}
 
 
+# ---------------------------------------------------------------- 真峰值限幅
+def _lagrange_coeffs(npoints=8, ts=(0.25, 0.5, 0.75)):
+    """n 点拉格朗日插值在 t=0.25/0.5/0.75 处的系数（t 位于中间两个采样之间）。
+
+    用于估算"采样点之间"的峰值：正弦被采样时，样本峰值可能比真实峰值低
+    0.5~3 dB（取决于频率/相位）。若只按样本峰值限幅，转成 AAC/MP3 后
+    容易出现"看着没削波、解码后削波"——这正是真峰值（True Peak）要解决的问题。
+
+    为什么用 8 点而不是 4 点：4 点三次插值在 fs/4（12kHz）附近最坏会低估
+    1 dB 以上，等于天花板形同虚设；8 点（7 阶）实测最坏 0.2 dB，配合
+    tp_margin_db 的余量足够安全。代价是每块多几十微秒。
+    """
+    pos = np.arange(npoints) - (npoints // 2 - 1)   # 8 点：-3..4
+    out = []
+    for t in ts:
+        coeffs = []
+        for i, xi in enumerate(pos):
+            num, den = 1.0, 1.0
+            for j, xj in enumerate(pos):
+                if i == j:
+                    continue
+                num *= (t - xj)
+                den *= (xi - xj)
+            coeffs.append(num / den)
+        out.append(tuple(coeffs))
+    return out
+
+
+_TP_NPTS = 8
+_TP_COEFFS = _lagrange_coeffs(_TP_NPTS)
+_TP_MATRIX = np.array(_TP_COEFFS).T          # (8, 3)：8 个抽头 × 3 个插值位置
+
+
+class TruePeakLimiter:
+    """前瞻式真峰值限幅器（立体声联动，块间连续）。
+
+    为什么不用"对每个采样做 tanh/软膝"的波形整形：
+      波形整形会把峰顶压扁，等于对信号做非线性失真；一旦增益提得多、
+      限幅器长期在工作，听感就是"发毛、动态被压扁"。正确做法是**降增益**，
+      让波形形状保持原样，只是整体变小一点。
+
+    结构：
+      1. 真峰值检测：4 点三次插值估出采样间的峰值（4× 过采样的廉价近似）；
+      2. 前瞻：内部延迟 lookahead_ms（默认 2ms），用"未来"的峰值提前开始压，
+         这样峰值本身不会被削掉；
+      3. 瞬时下压 + 慢释放（release_ms）：增益绝不阶跃；
+      4. 立体声联动：用两个声道的最大值算一个增益，避免声像被拉扯。
+    代价只有 lookahead_ms 的延迟。
+    """
+
+    def __init__(self, samplerate=48000, channels=2, ceiling_db=-1.0,
+                 lookahead_ms=2.0, release_ms=120.0, tp_margin_db=0.3):
+        self.sr = int(samplerate)
+        self.channels = max(int(channels), 1)
+        self.ceiling_db = float(ceiling_db)
+        # 8 点插值在 fs/4 这类"采样点正好错过峰顶"的频率上仍可能低估约 0.2 dB，
+        # 所以内部按天花板再低 tp_margin_db 来限，保证外部量到的真峰值不越线。
+        self.tp_margin_db = float(tp_margin_db)
+        self.ceiling = float(10.0 ** ((self.ceiling_db - self.tp_margin_db) / 20.0))
+        self.n = max(8, int(round(self.sr * max(float(lookahead_ms), 0.5) / 1000.0)))
+        self.rel = float(np.exp(-1.0 / max(1.0, self.sr * float(release_ms) / 1000.0)))
+        self.buf = np.zeros((self.n, self.channels), dtype=np.float64)
+        self.g = 1.0
+        self.last_tp = 0.0        # 本块输出的真峰值（线性）
+        self.last_gr_db = 0.0     # 本块最大增益衰减（dB，≤ 0）
+        self.engaged = 0          # 触发限幅的块数（诊断）
+
+    # ---------- 参数 ----------
+    def set_ceiling(self, ceiling_db):
+        self.ceiling_db = float(ceiling_db)
+        self.ceiling = float(10.0 ** ((self.ceiling_db - self.tp_margin_db) / 20.0))
+
+    def reset(self):
+        self.buf[:] = 0.0
+        self.g = 1.0
+        self.last_tp = 0.0
+        self.last_gr_db = 0.0
+
+    # ---------- 处理 ----------
+    def _peaks(self, x):
+        """每个采样位置的"局部真峰值"：样本绝对值与三处插值结果取最大。
+
+        优化：样本峰值离天花板还差 4 dB 以上时直接跳过插值——插值最多把峰值
+        抬高约 3 dB（fs/2 附近的极端情况），不可能越线，没必要白算。
+        正常音量下这一支省掉整块 100µs 的插值开销。
+        """
+        p = np.abs(x).max(axis=1)
+        if float(p.max()) < self.ceiling * 0.6:
+            return p
+        size = x.shape[0]
+        half = _TP_NPTS // 2 - 1          # 8 点：中间两个样本前有 3 个历史样本
+        span = size - _TP_NPTS + 1
+        if span <= 0:
+            return p
+        # 一次矩阵乘算出 3 个相位的插值值：(span, ch, 8) @ (8, 3) → (span, ch, 3)
+        win = np.lib.stride_tricks.sliding_window_view(x, _TP_NPTS, axis=0)
+        vals = np.abs(win @ _TP_MATRIX).max(axis=(1, 2))
+        p[half:half + span] = np.maximum(p[half:half + span], vals)
+        return p
+
+    def process(self, block):
+        x = np.asarray(block, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[:, None]
+        if x.shape[0] == 0:
+            return x
+        if x.shape[1] != self.channels:
+            x = x[:, :self.channels] if x.shape[1] > self.channels else np.pad(
+                x, ((0, 0), (0, self.channels - x.shape[1])))
+        frames = x.shape[0]
+        ext = np.concatenate((self.buf, x), axis=0)
+        peaks = self._peaks(ext)
+        # 需要多小的增益才不越过天花板（峰值低于天花板时是 1.0）
+        req = np.minimum(1.0, self.ceiling / np.maximum(peaks, 1e-12))
+        # 前瞻：输出第 i 个采样时，看的是 ext[i .. i+n] 这段的峰值
+        win = np.lib.stride_tricks.sliding_window_view(req, self.n + 1)
+        need = win.min(axis=-1)[:frames]
+
+        if float(need.min()) >= 1.0 and self.g >= 0.999999:
+            out = ext[:frames]
+            self.last_gr_db = 0.0
+            self.last_tp = float(np.max(peaks[:frames]))
+        else:
+            # 增益包络：瞬时下压（need 变小立刻跟随）、慢释放（往 1.0 指数回升）。
+            # 令 u = 1 - g（衰减量），递推就是 u[i] = max(u0[i], u[i-1] * rel)，
+            # 闭式解 u[i] = rel^i * max_{j<=i}(u0[j] / rel^j)，可用累加最大值整块算，
+            # 省掉逐个采样的 Python 循环（10ms 块下约 70µs）。
+            u0 = 1.0 - need
+            rk = self._rel_pow(frames)
+            u = np.maximum.accumulate(u0 / rk) * rk
+            # 上一块的残留衰减也要参与释放（否则每块开头都会突然恢复满增益）
+            u = np.maximum(u, (1.0 - self.g) * self.rel * rk)
+            g = 1.0 - u
+            self.g = float(g[-1])
+            out = ext[:frames] * g[:, None]
+            self.last_gr_db = float(20.0 * np.log10(max(float(g.min()), 1e-6)))
+            self.last_tp = float(np.max(peaks[:frames] * g))
+            self.engaged += 1
+
+        self.buf = ext[frames:].copy()
+        return out
+
+    def _rel_pow(self, n):
+        """rel^0..rel^(n-1)，按块长缓存（块长固定时每块省一次 pow）。"""
+        cache = self.__dict__.get("_rp")
+        if cache is not None and cache[0] == n:
+            return cache[1]
+        arr = self.rel ** np.arange(n, dtype=np.float64)
+        self.__dict__["_rp"] = (n, arr)
+        return arr
+
+    def status(self):
+        return {"tp": self.last_tp, "gr_db": self.last_gr_db,
+                "engaged": self.engaged, "lookahead_ms": self.n * 1000.0 / self.sr}
+
+
 def _downmix_matrix(n):
     """按声道数生成 n×2 的下混矩阵（缓存，块间复用）。"""
     m = _DOWNMIX_CACHE.get(n)

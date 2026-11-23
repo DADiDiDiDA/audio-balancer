@@ -31,7 +31,7 @@ from pycaw.pycaw import AudioSession, AudioUtilities  # noqa: F401
 import soundcard as sc
 
 import session
-from dsp import ClickGuard, DcBlocker, downmix_to_stereo
+from dsp import ClickGuard, DcBlocker, TruePeakLimiter, downmix_to_stereo
 from loudness import KWeighting, SlidingLUFS
 from wasapi_raw import RawPlayer
 
@@ -272,21 +272,35 @@ def volume_curve(v, ref=0.20, max_db=10.0):
     return float(10.0 ** (frac * max_db / 20.0))
 
 
-def desired_gain(mode, target, rng, lufs, max_att, max_boost):
+def desired_gain(mode, target, rng, lufs, max_att, max_boost,
+                 low_knee=None, knee_width=10.0):
     """输入响度 → 需要的增益（dB）。
 
     auto（自动电平）：目标是**区间** target ± rng。
         落在区间里 → 往区间中部拉，但只拉一半（温和不抽吸）；
-        偏低 → 提到中部（target），偏高 → 压到中部；上限 max_boost。
+        偏低 → 提到中部（target）；偏高 → 压到中部；上限 max_boost。
     limit（仅限制）：只把超过 target 的部分压下来，永不放大。
+
+    低电平拐点（v1.8.0）：
+        只要 lufs 低于 low_knee，就**不给任何提升**；从 low_knee 到
+        low_knee + knee_width 线性恢复。原因：无差别放大弱信号会把底噪、
+        呼吸声、环境噪声一起抬起来，听感"脏"。用拐点而不是噪声门：
+        噪声门有检测延迟和开合过渡，反而更容易被听出来。
     """
     if mode == "auto":
         err = target - lufs
         if abs(err) <= rng:
             # 区间内也往中部走，但力度减半：小声片段会被托起来，又不至于一直在动
-            return float(np.clip(err * 0.5, -max_att, max_boost))
-        return float(np.clip(err, -max_att, max_boost))
-    return float(np.clip(target - lufs, -max_att, 0.0))
+            gain = float(np.clip(err * 0.5, -max_att, max_boost))
+        else:
+            gain = float(np.clip(err, -max_att, max_boost))
+    else:
+        gain = float(np.clip(target - lufs, -max_att, 0.0))
+    if gain > 0.0 and low_knee is not None:
+        k = (float(lufs) - float(low_knee)) / max(float(knee_width), 1e-6)
+        k = 0.0 if k <= 0.0 else (1.0 if k >= 1.0 else k)
+        gain *= k
+    return gain
 
 
 class _Out:
@@ -358,6 +372,7 @@ class Engine:
             "lufs": -70.0, "gain_db": 0.0, "pre_db": 0.0,
             "input": "-", "output": "-", "out_mode": "-",
             "underrun": 0, "buffered": 0, "waiting": False, "win_vol": 1.0,
+            "out_tp_db": None, "out_gr_db": 0.0,
         }
 
     # ---------- 设备 ----------
@@ -685,6 +700,13 @@ class Engine:
 
         # 块边界平滑：欠载/丢块/增益突变都不再产生阶跃咔哒，代价只是每块开头 2ms 交叉
         guard = ClickGuard(SR, fade_ms=2.0, channels=CHANNELS)
+        # 前瞻式真峰值限幅：按"采样间峰值"限制，而不是对波形做软膝整形。
+        # 前者只降增益、波形形状不变；后者会把峰顶压扁，长期工作时听感发毛。
+        # 代价是 lookahead_ms（2ms）的额外延迟。
+        limiter = TruePeakLimiter(
+            SR, CHANNELS,
+            ceiling_db=self._num(cfg, "limiter_ceiling_db", -1.0, -12, 0),
+            lookahead_ms=2.0, release_ms=120.0)
 
         def playback():
             ensure_com()
@@ -749,6 +771,7 @@ class Engine:
                             dc.reset()
                             kw.reset()
                             meter.reset()
+                            limiter.reset()
                             state["warm"] = 0.0
                             state["gain"] = 0.0
                         if silent_block and (fast or quiet >= quiet_need):
@@ -757,6 +780,8 @@ class Engine:
                                 dc.reset()
                                 kw.reset()
                                 meter.reset()
+                                # 清掉前瞻缓冲里的旧音频，别在恢复时吐出一段 2ms 的残响
+                                limiter.reset()
                                 state["warm"] = 0.0
                                 state["gain"] = 0.0
                                 state["lufs"] = -70.0
@@ -769,6 +794,7 @@ class Engine:
                                               win_vol=state.get("win_vol", 1.0),
                                               underrun=state["underrun"],
                                               buffered=q.qsize(),
+                                              out_tp_db=None, out_gr_db=0.0,
                                               out_starves=pl.starves,
                                               out_pad_ms=round(pl.min_pad_ms, 1))
                             continue
@@ -818,6 +844,9 @@ class Engine:
                             state["gain"] = 0.0
                             y = apply_gain_ramp(x, pre * vol_gain, state)
                             y = soft_limit(y, 0.0)
+                            # 直通不过限幅器，峰值读数置空（别把上一段的旧值留着）
+                            limiter.last_tp = 0.0
+                            limiter.last_gr_db = 0.0
                         else:
                             gate = self._num(cfg, "silence_gate_lufs", -60, -90, -20)
                             enabled = bool(cfg.get("enabled", True))
@@ -827,11 +856,18 @@ class Engine:
                             if not enabled or state["lufs"] < gate or state["warm"] < 0.4:
                                 desired = 0.0
                             else:
+                                # 低电平拐点：比目标低 34dB 以上（默认）完全不提升，
+                                # 往上 10dB 内线性恢复——护住底噪，又不至于切掉弱对白
+                                knee_db = self._num(cfg, "low_knee_db", 34.0, 0.0, 60.0)
+                                knee = (target - knee_db) if knee_db > 0.0 else None
                                 desired = desired_gain(
                                     "auto" if auto else "limit", target,
                                     self._num(cfg, "target_range_db", 3, 0, 10),
                                     state["lufs"], max_att,
-                                    self._num(cfg, "max_boost_db", 12, 0, 30))
+                                    self._num(cfg, "max_boost_db", 12, 0, 30),
+                                    low_knee=knee,
+                                    knee_width=self._num(cfg, "low_knee_width_db",
+                                                         10.0, 1.0, 40.0))
 
                             attack = self._num(cfg, "gain_attack_ms", 120, 5, 3000) / 1000.0
                             release = self._num(cfg, "gain_release_ms", 900, 50, 8000) / 1000.0
@@ -849,7 +885,12 @@ class Engine:
                             y = apply_gain_ramp(
                                 x, pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain,
                                 state)
-                            y = soft_limit(y, self._num(cfg, "limiter_ceiling_db", -1.0, -6, 0))
+                            # 真峰值限幅（只降增益，不改波形）：天花板按界面上设的
+                            # dBTP 走，改了配置立刻生效，不需要重连
+                            ceil_db = self._num(cfg, "limiter_ceiling_db", -1.0, -12, 0)
+                            if abs(ceil_db - limiter.ceiling_db) > 1e-9:
+                                limiter.set_ceiling(ceil_db)
+                            y = limiter.process(y)
 
                         # 只在「真的不连续」时才在块首淡化；连续音频原样通过
                         y = guard.smooth(y, discontinuity=gap)
@@ -863,9 +904,13 @@ class Engine:
                         now = time.time()
                         if now - last > 0.25:
                             last = now
+                            tp = limiter.last_tp
                             self._publish(lufs=state["lufs"], gain_db=state["gain"],
                                           pre_db=state.get("pre_db", 0.0),
                                           win_vol=state.get("win_vol", 1.0),
+                                          out_tp_db=(round(20.0 * np.log10(tp), 1)
+                                                     if tp > 1e-6 else None),
+                                          out_gr_db=round(limiter.last_gr_db, 1),
                                           underrun=state["underrun"], buffered=q.qsize(),
                                           out_starves=pl.starves,
                                           out_pad_ms=round(pl.min_pad_ms, 1))

@@ -20,7 +20,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.7.3"
+VERSION = "1.8.0"
 
 SIDE_W = 192
 
@@ -71,9 +71,12 @@ def _fmt_db(v):
 
 
 def _latency_ms(block_ms):
-    """端到端延迟估算，与引擎口径一致：采集/队列 2 块 + 设备缓冲（两块+6ms，下限 24）。"""
+    """端到端延迟估算，与引擎口径一致：
+
+    采集/队列 2 块 + 设备缓冲（两块+6ms，下限 24）+ 限幅器前瞻 2ms。
+    """
     block_ms = float(block_ms)
-    return block_ms * 2 + max(24.0, block_ms * 2 + 6)
+    return block_ms * 2 + max(24.0, block_ms * 2 + 6) + 2.0
 
 
 def _fmt_lufs(v):
@@ -569,11 +572,13 @@ class AppWindow:
                 float(cfg.get("max_boost_db", 12)), 0, 24, 1,
                 self._on_maxboost, fmt=lambda v: "+%.0f dB" % v,
                 disabled=not auto, note="" if auto else "仅自动电平",
-                tip="最多把安静的部分提上来多少 dB。提得越多，底噪也一起被放大。")
+                tip="最多把安静的部分提上来多少 dB。提得越多底噪也一起被放大；"
+                    "比目标低 34 dB 以上的片段不会再提升（护底噪拐点）。")
         p.field(x + 22, ly + 98, col, "限幅上限",
                 float(cfg.get("limiter_ceiling_db", -1)), -6, 0, 0.5,
                 self._on_ceiling, fmt=lambda v: "%.1f dBFS" % v,
-                tip="输出的绝对上限。0 是数字满刻度，留 −1 dB 给重采样/编码的余量。")
+                tip="输出的绝对上限，按真峰值（dBTP）算：会检查采样点之间的峰值，"
+                    "不是只看采样点。留 −1 dB 是给 AAC/MP3 重编码的余量。")
         p.field(x + 22 + col + 26, ly + 98, col, "处理前降低",
                 float(cfg.get("pre_gain_db", 0)), -24, 0, 1,
                 self._on_pre, fmt=lambda v: "%+.0f dB" % v,
@@ -844,10 +849,13 @@ class AppWindow:
             self._set_live_text("mode", self.m_mode,
                                 "已绕过音效" if st.get("out_mode") == "raw" else "经系统音效")
             self._set_mark(lufs)
-            foot = ("响度 %s LUFS · 增益 %s · Win音量 %.0f%%" % (
-                _fmt_lufs(lufs), _fmt_db(gain),
-                float(st.get("win_vol", 1.0) or 1.0) * 100))
-            self._set_foot(foot, pal["sub"])
+            parts = ["响度 %s LUFS" % _fmt_lufs(lufs), "增益 " + _fmt_db(gain)]
+            tp = st.get("out_tp_db")
+            if isinstance(tp, (int, float)) and tp > -90:
+                parts.append("峰值 %.1f dBTP" % tp)
+            parts.append("Win音量 %.0f%%"
+                         % (float(st.get("win_vol", 1.0) or 1.0) * 100))
+            self._set_foot(" · ".join(parts), pal["sub"])
         elif err:
             self._set_foot(str(err), pal["err"])
         elif waiting:

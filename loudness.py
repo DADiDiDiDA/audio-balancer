@@ -2,7 +2,8 @@
 
 包含：
   * K-weighting 滤波（预滤波 high-shelf + RLB high-pass），双二阶级联，保留滤波状态；
-  * 滑动窗口 LUFS 计算（立体声权重 1/1，5.1 权重 1/1/1.41/1/1/1.41）。
+  * 滑动窗口 LUFS 计算（立体声权重 1/1，5.1 权重 1/1/1.41/1/1/1.41）；
+  * 两级门控：绝对 -70 LUFS + 相对 -10 LU（v1.8.0），避免长静音把测量拉低。
 
 参考：EBU R128 / ITU-R BS.1770-4 标准系数。
 """
@@ -74,11 +75,25 @@ class KWeighting:
 
 
 class SlidingLUFS:
-    """滑动窗口积分响度（LUFS）。
+    """滑动窗口积分响度（LUFS），带 BS.1770-4 的两级门控。
 
-    对滤波后信号按块计算加权均方，在 window_ms 时间窗内累加，
-    按 BS.1770 公式 -0.691 + 10*log10(加权均方) 得到 LUFS。
+    对滤波后信号按块计算加权均方，在 window_ms 时间窗内累加，按 BS.1770 公式
+    -0.691 + 10*log10(加权均方) 得到 LUFS。
+
+    为什么要门控（v1.8.0）：
+      不做门控时，窗口里的静音/极弱段会把平均值直接拉低——长静音之后、
+      或者音乐里的停顿、片头片尾，测出来的"响度"能低 10 dB 以上，
+      均衡器于是拼命往上提，一有声音就过响，随后又被压下来，就是"响度跳变"。
+      BS.1770 的做法是两级门控：
+        1) 绝对门限 -70 LUFS：低于它的块根本不参与（这是"没节目"而不是"小声"）；
+        2) 相对门限：比（过绝对门限后的）平均值低 10 LU 以上的块也剔除，
+           这样只有"真正在发声"的段落决定响度。
+      本实现把这两级门控放进滑动窗口里做，作为实时短时响度使用
+      （标准里的积分响度是 400ms 块 + 75% 重叠，此处窗口可配、默认 1 秒）。
     """
+
+    ABS_GATE_LUFS = -70.0
+    REL_GATE_LU = -10.0
 
     def __init__(self, sr=48000, window_ms=1000):
         self.sr = int(sr)
@@ -87,6 +102,8 @@ class SlidingLUFS:
         self.blocks = deque()
         self.sum = 0.0
         self.count = 0
+        # 绝对门限对应的加权均方：LUFS = -0.691 + 10log10(z)
+        self._abs_z = float(10.0 ** ((self.ABS_GATE_LUFS + 0.691) / 10.0))
 
     def update(self, filtered_block):
         x = np.asarray(filtered_block, dtype=float)
@@ -100,8 +117,6 @@ class SlidingLUFS:
         #   7.1 = FL FR FC LFE BL BR SL SR -> 1 1 1 0 1.41 1.41 1.41 1.41
         # LFE 必须权重 0（不计入响度），否则低音炮能量会被当成整体响度，
         # 导致低频重的影片/音乐被过度衰减，人声反而变小。
-        # 早期版本权重整体错位（把 LFE 计入 1.0、中置算 1.41、环绕算 1.0），
-        # 会让 5.1 内容的响度判断偏差数 dB，这里按标准修正。
         if ch == 6:
             weights = np.array([1.0, 1.0, 1.0, 0.0, 1.41, 1.41])
         elif ch == 8:
@@ -114,15 +129,40 @@ class SlidingLUFS:
         self.blocks.append((n, weighted))
         self.sum += weighted * n
         self.count += n
-        while len(self.blocks) > 1 and self.count - self.blocks[0][0] > self.window_samples:
+        # 窗口严格不超过 window_samples：以前的条件会在窗口里多留一块，
+        # 50ms 块时等效窗口 1.05s，门控后的"大声记忆"也跟着多留一块。
+        while len(self.blocks) > 1 and self.count > self.window_samples:
             n0, v0 = self.blocks.popleft()
             self.sum -= v0 * n0
             self.count -= n0
         return self.value()
 
     def value(self):
-        mean = self.sum / max(self.count, 1)
-        return -0.691 + 10.0 * np.log10(mean + 1e-12)
+        """门控后的 LUFS；窗口里没有有效节目时返回 -70.0（不是 -120）。"""
+        blocks = self.blocks
+        if not blocks:
+            return self.ABS_GATE_LUFS
+        # 第一级：绝对门限
+        n_sum = 0.0
+        z_sum = 0.0
+        for n, z in blocks:
+            if z >= self._abs_z:
+                n_sum += n
+                z_sum += z * n
+        if n_sum <= 0.0:
+            return self.ABS_GATE_LUFS
+        lufs_abs = -0.691 + 10.0 * np.log10(z_sum / n_sum)
+        # 第二级：相对门限（比过绝对门限后的平均值低 10 LU 以上剔除）
+        rel_z = float(10.0 ** ((lufs_abs + self.REL_GATE_LU + 0.691) / 10.0))
+        n2 = 0.0
+        z2 = 0.0
+        for n, z in blocks:
+            if z >= rel_z:
+                n2 += n
+                z2 += z * n
+        if n2 <= 0.0:
+            return float(lufs_abs)
+        return float(-0.691 + 10.0 * np.log10(z2 / n2))
 
     def reset(self):
         self.blocks.clear()
