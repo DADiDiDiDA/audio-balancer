@@ -263,6 +263,15 @@ WASAPI 补静音就是那声轻微「刺啦」。
 
 ---
 
+### v1.8.2 核查补记（控制层与 UI）
+
+- **`_poll` 必须 try/finally**：`after(220)` 在函数末尾才排，中间任何一次异常都会让界面永久停止刷新。包装成 `_poll` + `_poll_once`，`finally` 里排下一次。
+- **配置要按键合并**：两个进程（核心 / 界面）各持完整快照，整份覆盖会抹掉对方刚改的值（守护改的 `output_device` 被界面关窗覆盖）。`Config` 记录 `_dirty_keys`，保存时只把这些键合并进磁盘最新内容；读取按 `DEFAULTS` 类型校验。
+- **保存失败不能清 dirty**：先清标记再写盘 = 一次瞬时失败永久丢改动。
+- **画布内嵌控件要自己销毁**：`canvas.delete("all")` 不销毁 `create_window` 里的 Tk 控件，`Painter._track()` 登记、`render()` 开头 `destroy()`。
+- **自动静音只接管真正改过的会话**：`_orig` 只在第一次 `SetMasterVolume` 前记录；用户手动改音量（raw 与上次写入差 >0.05）以新值为准；前台判定加 PID，UWP 宿主在前台时不执行后台静音。
+- **退出时在控制线程里 restore**：COM 会话对象属于创建它的线程，主线程跨线程调用会 `RPC_E_WRONG_THREAD` 被吞，留下 0 音量。
+
 ## 8. 构建与验证
 
 ```bash
