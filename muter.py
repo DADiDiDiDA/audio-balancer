@@ -75,12 +75,14 @@ class Muter:
     def __init__(self, config):
         self.config = config
         self._vol = {}
-        self._orig = {}          # key -> 接管前用户自己的音量
+        self._orig = {}          # key -> (接管前音量, pid, 进程名)
         self._sessions = []
         self._names = {}
+        self._games_seen = set()
         self._fg_pid = 0
         self._stopping = False
         self._last_enum = 0.0
+        self._last_tick = None
         self._self_pid = os.getpid()
         self.foreground = ""
         self.in_game = False
@@ -129,6 +131,28 @@ class Muter:
             v = ""
         return v or (s.ProcessId, s.DisplayName or "")
 
+    def _orig_key(self, s, name):
+        """在 _orig 里找这个会话的记录：优先会话标识，其次 pid+进程名。
+
+        会话标识（InstanceIdentifier）会随进程重开 / 音频引擎重建而变化。
+        只按标识记的话，程序重开一次就再也认不出「这是我压低过的」，
+        音量会永久停在 0 —— 删名单也救不回来。
+        """
+        key = self._key(s)
+        if key in self._orig:
+            return key
+        pid = int(getattr(s, "ProcessId", 0) or 0)
+        if not pid:
+            return ""
+        for k, rec in list(self._orig.items()):
+            if rec[1] == pid and (not name or rec[2] == name):
+                # 迁移到新标识，后续写入/恢复都走同一个键
+                self._orig[key] = self._orig.pop(k)
+                if k in self._vol:
+                    self._vol[key] = self._vol.pop(k)
+                return key
+        return ""
+
     def _pname(self, s):
         pid = s.ProcessId
         if pid in self._names:
@@ -143,7 +167,9 @@ class Muter:
     def tick(self, now):
         cfg = self.config.snapshot()
         if not cfg.get("mute_enabled", True):
-            if self._vol:
+            # _orig 非空也要还原：只判断 _vol 时，会话标识变化后 _vol 已清、
+            # _orig 还留着记录，关掉开关就再也恢复不了。
+            if self._vol or self._orig:
                 self.restore()
             self.in_game = False
             self.controlled = 0
@@ -166,7 +192,17 @@ class Muter:
 
         fg_vol = _num(cfg, "mute_fg_volume", 1.0, 0.0, 1.0)
         bg_vol = _num(cfg, "mute_bg_volume", 0.0, 0.0, 1.0)
-        alpha = min(1.0, 200.0 / max(100.0, _num(cfg, "mute_easing_ms", 500, 50, 10000)))
+        # 渐变系数按「真实经过时间」算，而不是固定按 0.3 秒一次估：
+        # 以前 easing=300ms 实际要约 0.9 秒才到位，设 2000ms 和 1000ms 听感差不多。
+        if self._last_tick is None:
+            # 第一拍只记录时间：没有「上一次」就没有真实间隔，不能凭 0.3 秒猜
+            self._last_tick = now
+            alpha = 0.0
+        else:
+            dt = min(max(now - self._last_tick, 0.0), 1.0)
+            self._last_tick = now
+            tau = max(0.05, _num(cfg, "mute_easing_ms", 500, 50, 10000) / 1000.0)
+            alpha = 1.0 - math.exp(-dt / tau)
         # UWP / 商店游戏的前台窗口属于 ApplicationFrameHost，进程名对不上游戏本体。
         # 这种情况下别把列表里的程序当"后台"静音——那会让正在玩的游戏直接没声音。
         fg_uncertain = self.foreground in ("applicationframehost.exe", "shellhost.exe")
@@ -202,9 +238,10 @@ class Muter:
                 # 不在处理范围：如果我们之前动过，还原一次，然后完全放手。
                 # 以前会把 target 设成"记录的原始音量"，于是用户手动把音量调小
                 # 之后，音量条会被一点点拉回去（看起来像自己在跳）。
-                if key in self._orig:
-                    orig = self._orig.pop(key)
-                    self._vol.pop(key, None)
+                okey = self._orig_key(s, name)
+                if okey:
+                    orig = self._orig.pop(okey)[0]
+                    self._vol.pop(okey, None)
                     try:
                         if abs(raw - orig) > 0.005:
                             s.SimpleAudioVolume.SetMasterVolume(orig, None)
@@ -215,10 +252,10 @@ class Muter:
             last = self._vol.get(key)
             if key not in self._orig:
                 # 只有真的要改它时才记原值，避免把没动过的程序也记下来
-                self._orig[key] = raw
+                self._orig[key] = (raw, int(getattr(s, "ProcessId", 0) or 0), name)
             elif last is not None and abs(raw - last) > 0.05:
                 # 用户自己拖了音量条：以他的新值为基准，别再拉回旧值
-                self._orig[key] = raw
+                self._orig[key] = (raw, int(getattr(s, "ProcessId", 0) or 0), name)
 
             cur = last if last is not None else raw
             new = cur + (target - cur) * alpha
@@ -228,12 +265,20 @@ class Muter:
             try:
                 if abs(raw - new) > 0.005:
                     s.SimpleAudioVolume.SetMasterVolume(new, None)
-                if new < 0.99 and new < self._orig[key] - 0.05:
+                if new < 0.99 and new < self._orig[key][0] - 0.05:
                     controlled += 1
                     muted.append(name or ("pid %s" % s.ProcessId))
             except Exception:
                 continue
         for k in [k for k in self._vol if k not in seen]:
+            self._vol.pop(k, None)
+        # 会话暂时不在枚举里（程序暂停出声 / 采集空档）时保留记录：
+        # 进程还活着就等它回来，进程没了才丢弃。否则「删除名单后恢复」
+        # 会因为这些记录被清掉而永远恢复不了。
+        dead = [k for k, rec in self._orig.items()
+                if k not in seen and not _pid_alive(rec[1])]
+        for k in dead:
+            self._orig.pop(k, None)
             self._vol.pop(k, None)
         if len(self._orig) > 200:
             self._orig = {k: v for k, v in self._orig.items() if k in seen}
@@ -247,25 +292,36 @@ class Muter:
                     continue
                 if s.ProcessId == self._self_pid:
                     continue
-                key = self._key(s)
+                name = self._pname(s)
                 # 只还原「我们确实动过」的会话。以前缺省写 1.0，等于把没被处理过
                 # 的程序（新开的、在忽略名单里的）音量强行拉到 100% —— 退出/关开关
                 # 时莫名其妙声音变大就是这么来的。
-                if key not in self._orig:
+                okey = self._orig_key(s, name)
+                if not okey:
                     continue
+                orig = self._orig[okey][0]
                 # 当前值已经不等于我们上次写入的值 → 用户自己调过，别覆盖
-                last = self._vol.get(key)
+                last = self._vol.get(okey)
                 try:
                     cur = float(s.SimpleAudioVolume.GetMasterVolume())
                 except Exception:
                     cur = None
                 if last is not None and cur is not None and abs(cur - last) > 0.05:
                     continue
-                if cur is None or abs(cur - self._orig[key]) > 0.005:
-                    s.SimpleAudioVolume.SetMasterVolume(self._orig[key], None)
+                if cur is None or abs(cur - orig) > 0.005:
+                    s.SimpleAudioVolume.SetMasterVolume(orig, None)
             except Exception:
                 continue
         self._vol.clear()
         self._orig.clear()
         self.muted = []
         self.controlled = 0
+
+
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return False

@@ -21,7 +21,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 
 SIDE_W = 192
 
@@ -689,7 +689,7 @@ class AppWindow:
                   right=x + w - 22,
                   tip="只认这里的程序。进程名看任务管理器「详细信息」里的名称，不区分大小写。")
         lb = p.listbox(x + 24, gy + head, w - 48, list_h)
-        for g in (cfg.get("mute_games", []) or []):
+        for g in sorted((cfg.get("mute_games", []) or []), key=str.lower):
             lb.insert("end", g)
         self.m_list = lb
         row_y = gy + head + list_h + 8
@@ -1248,9 +1248,13 @@ class AppWindow:
         if lb is None:
             return
         try:
+            keep = {lb.get(i) for i in lb.curselection()}
             lb.delete(0, "end")
-            for g in (self.config.get("mute_games", []) or []):
+            items = sorted(self.config.get("mute_games", []) or [], key=str.lower)
+            for i, g in enumerate(items):
                 lb.insert("end", g)
+                if g in keep:
+                    lb.selection_set(i)
         except Exception:
             pass
 
@@ -1262,7 +1266,7 @@ class AppWindow:
         if name.lower() in [g.lower() for g in games]:
             return
         games.append(name)
-        self._set("mute_games", games)
+        self._set("mute_games", sorted(games, key=str.lower))
         self.var_newgame.set("")
         self._fill_list()
 
@@ -1273,16 +1277,16 @@ class AppWindow:
         sel = list(lb.curselection())
         if not sel:
             return
-        games = list(self.config.get("mute_games", []) or [])
-        for i in reversed(sel):
-            if 0 <= i < len(games):
-                games.pop(i)
-        self._set("mute_games", games)
+        picked = {lb.get(i) for i in sel}
+        games = [g for g in (self.config.get("mute_games", []) or [])
+                 if g not in picked]
+        self._set("mute_games", sorted(games, key=str.lower))
+        # 核心进程每 0.3 秒按新名单 tick 一次，被删掉的程序会自动还原音量
         self._fill_list()
 
     def _reset_games(self):
         from config import DEFAULTS
-        self._set("mute_games", list(DEFAULTS["mute_games"]))
+        self._set("mute_games", sorted(DEFAULTS["mute_games"], key=str.lower))
         self._fill_list()
 
     # ---- 设备 ----

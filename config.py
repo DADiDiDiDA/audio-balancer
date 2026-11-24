@@ -145,6 +145,7 @@ class Config:
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                self.load_error = None
                 with self._lock:
                     for k, v in data.items():
                         if k not in DEFAULTS:
@@ -171,10 +172,16 @@ class Config:
             data = copy.deepcopy(self._data)
             keys = set(self._dirty_keys)
             ver = self._version
+        exists = os.path.exists(self.path)
+        # 没有改动就不用写盘：核心进程退出时曾用自己启动时读到的旧快照整份写回，
+        # 把界面运行中改好的目标响度/增益/静音名单覆盖回旧值 —— 听感就是
+        # 「运行中调好的，重启后又变了」。没脏键一律不写。
+        if exists and not keys:
+            return True
         # 核心进程（设备守护）和界面进程各持一份完整快照。以前谁后写谁整份覆盖：
         # 守护刚把 output_device 改成新耳机，界面关窗时用旧快照又改回去了。
         # 现在只把自己改动过的键合并进磁盘上的最新内容，其余键以磁盘为准。
-        if keys and os.path.exists(self.path):
+        if keys and exists:
             try:
                 with open(self.path, "r", encoding="utf-8-sig") as f:
                     disk = json.load(f)
