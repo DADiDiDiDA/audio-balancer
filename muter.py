@@ -13,6 +13,8 @@
 退出或关闭开关时恢复成用户自己原来的音量。
 """
 import ctypes
+import ctypes.wintypes  # noqa: F401  （显式导入，别依赖其它库顺手加载）
+import math
 import os
 
 import psutil
@@ -34,19 +36,39 @@ def ensure_com():
     return (hr + 2 ** 32) not in (0, 0x80010106)
 
 
-def foreground_process_name():
+def _num(cfg, key, default, lo, hi):
+    """取数值配置：非数字/NaN/越界都退回默认值。
+
+    以前 tick 里直接 float(cfg.get(...))，配置里一个 null 就抛异常，
+    整个自动静音停摆，而且每 0.3 秒往日志里写一遍完整 traceback。
+    """
+    try:
+        v = float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        v = float(default)
+    if not math.isfinite(v):
+        v = float(default)
+    return max(float(lo), min(float(hi), v))
+
+
+def foreground_info():
+    """返回 (前台进程名小写, 前台 PID)。"""
     user32 = ctypes.windll.user32
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
-        return ""
+        return "", 0
     pid = ctypes.wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not pid.value:
-        return ""
+        return "", 0
     try:
-        return (psutil.Process(pid.value).name() or "").lower()
+        return (psutil.Process(pid.value).name() or "").lower(), int(pid.value)
     except Exception:
-        return ""
+        return "", int(pid.value)
+
+
+def foreground_process_name():
+    return foreground_info()[0]
 
 
 class Muter:
@@ -56,6 +78,8 @@ class Muter:
         self._orig = {}          # key -> 接管前用户自己的音量
         self._sessions = []
         self._names = {}
+        self._fg_pid = 0
+        self._stopping = False
         self._last_enum = 0.0
         self._self_pid = os.getpid()
         self.foreground = ""
@@ -129,20 +153,23 @@ class Muter:
         if now - self._last_enum > 3.0:
             self._last_enum = now
             self._sessions = self._enum()
-            if len(self._names) > 300:
-                self._names.clear()
+            # PID 会被系统复用：进程名缓存不能永久保留，每次重枚举就清一次
+            self._names.clear()
 
         games = {str(g).lower() for g in (cfg.get("mute_games") or [])}
         ignore = {str(g).lower() for g in (cfg.get("mute_ignore") or [])}
-        self.foreground = foreground_process_name()
+        self.foreground, self._fg_pid = foreground_info()
         self.in_game = bool(games) and self.foreground in games
         mute_bg_listed = bool(cfg.get("mute_listed_in_background", True))
         # 与 config.DEFAULTS 保持一致（这里以前写 True，缺键时行为和界面对不上）
         mute_others = bool(cfg.get("mute_others_in_game", False))
 
-        fg_vol = float(cfg.get("mute_fg_volume", 1.0))
-        bg_vol = float(cfg.get("mute_bg_volume", 0.0))
-        alpha = min(1.0, 200.0 / max(100.0, float(cfg.get("mute_easing_ms", 500))))
+        fg_vol = _num(cfg, "mute_fg_volume", 1.0, 0.0, 1.0)
+        bg_vol = _num(cfg, "mute_bg_volume", 0.0, 0.0, 1.0)
+        alpha = min(1.0, 200.0 / max(100.0, _num(cfg, "mute_easing_ms", 500, 50, 10000)))
+        # UWP / 商店游戏的前台窗口属于 ApplicationFrameHost，进程名对不上游戏本体。
+        # 这种情况下别把列表里的程序当"后台"静音——那会让正在玩的游戏直接没声音。
+        fg_uncertain = self.foreground in ("applicationframehost.exe", "shellhost.exe")
 
         controlled = 0
         seen = set()
@@ -160,25 +187,40 @@ class Muter:
                 raw = float(s.SimpleAudioVolume.GetMasterVolume())
             except Exception:
                 continue
-            # 记住用户原本的音量，恢复时按原值还原，而不是粗暴拉满 1.0
-            if key not in self._orig:
-                self._orig[key] = raw
 
             listed = name in games
-            is_foreground = bool(name) and name == self.foreground
+            # 进程名比对外加 PID 比对：同名程序、以及靠启动器拉起的游戏都能认准
+            is_foreground = bool(name) and (name == self.foreground
+                                            or s.ProcessId == self._fg_pid)
             if listed and is_foreground:
-                # 列表里的程序在前台：保持正常音量
-                target = fg_vol
-            elif listed and mute_bg_listed:
-                # 列表里的程序在后台（最小化/挂机）：静音它自己
-                target = bg_vol
+                target = fg_vol          # 在前台：保持正常音量
+            elif listed and mute_bg_listed and not fg_uncertain:
+                target = bg_vol          # 在后台（最小化/挂机）：静音它自己
             elif self.in_game and mute_others:
-                # 列表里的程序在前台：其它程序让路
-                target = bg_vol
+                target = bg_vol          # 游戏在前台：其它程序让路
             else:
-                target = self._orig[key]
+                # 不在处理范围：如果我们之前动过，还原一次，然后完全放手。
+                # 以前会把 target 设成"记录的原始音量"，于是用户手动把音量调小
+                # 之后，音量条会被一点点拉回去（看起来像自己在跳）。
+                if key in self._orig:
+                    orig = self._orig.pop(key)
+                    self._vol.pop(key, None)
+                    try:
+                        if abs(raw - orig) > 0.005:
+                            s.SimpleAudioVolume.SetMasterVolume(orig, None)
+                    except Exception:
+                        pass
+                continue
 
-            cur = self._vol.get(key, raw)
+            last = self._vol.get(key)
+            if key not in self._orig:
+                # 只有真的要改它时才记原值，避免把没动过的程序也记下来
+                self._orig[key] = raw
+            elif last is not None and abs(raw - last) > 0.05:
+                # 用户自己拖了音量条：以他的新值为基准，别再拉回旧值
+                self._orig[key] = raw
+
+            cur = last if last is not None else raw
             new = cur + (target - cur) * alpha
             if abs(new - target) < 0.01:
                 new = target
@@ -211,7 +253,16 @@ class Muter:
                 # 时莫名其妙声音变大就是这么来的。
                 if key not in self._orig:
                     continue
-                s.SimpleAudioVolume.SetMasterVolume(self._orig[key], None)
+                # 当前值已经不等于我们上次写入的值 → 用户自己调过，别覆盖
+                last = self._vol.get(key)
+                try:
+                    cur = float(s.SimpleAudioVolume.GetMasterVolume())
+                except Exception:
+                    cur = None
+                if last is not None and cur is not None and abs(cur - last) > 0.05:
+                    continue
+                if cur is None or abs(cur - self._orig[key]) > 0.005:
+                    s.SimpleAudioVolume.SetMasterVolume(self._orig[key], None)
             except Exception:
                 continue
         self._vol.clear()

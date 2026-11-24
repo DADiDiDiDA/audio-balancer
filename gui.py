@@ -21,7 +21,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 
 SIDE_W = 192
 
@@ -137,6 +137,7 @@ class AppWindow:
         self._tip_ids = []         # 气泡的 canvas item（重建页面时清掉）
         self._foot_hold = None     # 状态栏临时提示 (文字, 颜色, 截止时间)
         self._live = {}            # 实时数值的「上次显示值」，没变就不重绘
+        self._devices_dirty = False  # 设备列表变了但正在拖控件，松手后再整页重画
         self.meter = None
         self.m_band = None
         self.m_preset_seg = None   # 预设分段控件（改数值时要即时把高亮挪到「自定义」）
@@ -415,6 +416,17 @@ class AppWindow:
     # ---------------------------------------------------------------- 渲染
     def render(self):
         pal = self.pal
+        # 先销毁上一轮的内嵌控件（下拉框 / 输入框 / 列表框）：
+        # canvas.delete("all") 只清画布图元，这些 Tk 控件会一直挂在 canvas 上
+        for w in list(getattr(self.body, "_embedded", []) or []):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        try:
+            self.body._embedded = []
+        except Exception:
+            pass
         self.body.delete("all")
         ui_kit.reset_cache()
         self._hits = []
@@ -705,6 +717,7 @@ class AppWindow:
         cb1.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
         p.cv.create_window(x + 132, cy + 56, window=cb1, anchor="nw",
                            width=w - 176, height=30)
+        p._track(cb1)
 
         p.text(x + 22, cy + 106, "输出设备", 10, pal["sub"])
         p.help(x + 22 + ui_kit.text_width("输出设备", 10) + 12, cy + 106,
@@ -715,6 +728,7 @@ class AppWindow:
         cb2.bind("<<ComboboxSelected>>", lambda e: self._apply_device())
         p.cv.create_window(x + 132, cy + 100, window=cb2, anchor="nw",
                            width=w - 176, height=30)
+        p._track(cb2)
 
         blk = float(cfg.get("block_ms", 15))
         p.field(x + 22, cy + 142, w - 44, "缓冲（越小延迟越低；10ms 已很稳）",
@@ -955,8 +969,8 @@ class AppWindow:
     def _update_default_label(self):
         if not getattr(self, "m_default", None) or self.guard is None:
             return
-        g = self.guard.status()
-        line = "系统默认输出：%s" % (g["default"] or "—")
+        g = self.guard.status() or {}
+        line = "系统默认输出：%s" % (g.get("default") or "—")
         if g.get("error"):
             line += "　⚠ %s" % g["error"]
         elif g.get("rdp"):
@@ -974,6 +988,17 @@ class AppWindow:
             pass
 
     def _poll(self):
+        """220ms 一次的刷新链：单次异常绝不能打断 after()，否则界面就永久冻住。"""
+        try:
+            self._poll_once()
+        except Exception:
+            pass
+        try:
+            self.root.after(220, self._poll)
+        except Exception:
+            pass
+
+    def _poll_once(self):
         try:
             while True:
                 cmd = self.cmds.get_nowait()
@@ -1000,8 +1025,13 @@ class AppWindow:
                 pass
         self._follow_devices()
         self._follow_config()
+        # 设备列表变了：正在拖控件就先挂着，松手（_active 变 None）后再重绘，
+        # 否则滑块会被从手底下拆掉、弹回旧值
+        if self._devices_dirty and self._active is None:
+            self._devices_dirty = False
+            if self.page == "device":
+                self.render()
         self._update_live()
-        self.root.after(220, self._poll)
 
     def _follow_devices(self):
         """核心进程异步提供设备列表；UI 启动时状态文件可能还没写好。
@@ -1017,8 +1047,7 @@ class AppWindow:
         if ins == self._inputs and outs == self._outputs:
             return
         self._inputs, self._outputs = ins, outs
-        if self.page == "device":
-            self.render()
+        self._devices_dirty = True      # 由 _poll_once 在合适时机重绘
 
     def _follow_config(self):
         """托盘 / 设备守护改了配置时，界面跟着变（不反向写配置）。"""

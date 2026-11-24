@@ -94,6 +94,27 @@ DEFAULTS = {
 }
 
 
+def _coerce(default, value):
+    """按默认值的类型校验磁盘上的值；类型不符返回 None（保留默认值）。
+
+    配置文件被手工编辑/脚本写坏时（"block_ms": null、"target_lufs": "abc"），
+    以前 get() 原样返回，界面 float() 直接抛异常 → 整页渲染失败、刷新链断掉。
+    """
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else None
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+    if isinstance(default, str):
+        return value if isinstance(value, str) else None
+    if isinstance(default, list):
+        return value if isinstance(value, list) else None
+    if isinstance(default, dict):
+        return value if isinstance(value, dict) else None
+    return value
+
+
 def app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -111,6 +132,7 @@ class Config:
         self._version = 0
         self._timer = None
         self._dirty = False
+        self._dirty_keys = set()      # 这次没落盘的键：保存时只把这些合并进磁盘
         self._delay = float(autosave_delay)
         self.load()
 
@@ -125,7 +147,14 @@ class Config:
             if isinstance(data, dict):
                 with self._lock:
                     for k, v in data.items():
-                        if k in DEFAULTS and self._data.get(k) != v:
+                        if k not in DEFAULTS:
+                            continue
+                        v = _coerce(DEFAULTS[k], v)
+                        if v is None:
+                            # 类型不对就保留默认值，并记下来让界面提示
+                            self.load_error = "配置项 %s 的类型不对，已改用默认值" % k
+                            continue
+                        if self._data.get(k) != v:
                             self._data[k] = v
                             changed = True
                     if changed:
@@ -140,6 +169,22 @@ class Config:
     def save(self):
         with self._lock:
             data = copy.deepcopy(self._data)
+            keys = set(self._dirty_keys)
+            ver = self._version
+        # 核心进程（设备守护）和界面进程各持一份完整快照。以前谁后写谁整份覆盖：
+        # 守护刚把 output_device 改成新耳机，界面关窗时用旧快照又改回去了。
+        # 现在只把自己改动过的键合并进磁盘上的最新内容，其余键以磁盘为准。
+        if keys and os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8-sig") as f:
+                    disk = json.load(f)
+                if isinstance(disk, dict):
+                    for k in keys:
+                        if k in data:
+                            disk[k] = data[k]
+                    data = disk
+            except Exception:
+                pass
         tmp = None
         try:
             folder = os.path.dirname(self.path) or "."
@@ -148,6 +193,9 @@ class Config:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
             tmp = None
+            with self._lock:
+                if self._version == ver:
+                    self._dirty_keys.clear()
             self.save_error = None
             self.saved_at = time.time()
             return True
@@ -169,12 +217,14 @@ class Config:
         """改一项：内存立即生效，磁盘写入合并到 0.4 秒后。"""
         with self._lock:
             self._data[key] = value
+            self._dirty_keys.add(key)
             self._version += 1
         self._touch()
 
     def update(self, patch):
         with self._lock:
             self._data.update(patch)
+            self._dirty_keys.update(patch)
             self._version += 1
         self._touch()
 
@@ -214,11 +264,26 @@ class Config:
             self._timer = None
             if not self._dirty:
                 return
-            self._dirty = False
-        self.save()
+            ver = self._version
+        ok = self.save()
+        with self._lock:
+            if ok and self._version == ver:
+                # 只有"写盘期间没有新改动"才算干净；否则保留脏标记再写一次
+                self._dirty = False
+                return
+            self._dirty = True
+            if self._timer is None:
+                t = threading.Timer(max(self._delay, 1.0), self._flush)
+                t.daemon = True
+                self._timer = t
+                t.start()
 
     def save_now(self):
-        """立即落盘（退出、点「立即保存」时用）。"""
+        """立即落盘（退出、点「立即保存」时用）。
+
+        失败时必须保留脏标记：以前先清 dirty 再 save()，一次瞬时失败（文件被占用 /
+        磁盘满）就让这次改动永久丢失，界面还显示「已保存」。
+        """
         with self._lock:
             if self._timer is not None:
                 try:
@@ -226,8 +291,14 @@ class Config:
                 except Exception:
                     pass
                 self._timer = None
-            self._dirty = False
-        return self.save()
+            ver = self._version
+        ok = self.save()
+        with self._lock:
+            if ok and self._version == ver:
+                self._dirty = False
+            else:
+                self._dirty = True
+        return ok
 
     # ---------- 给界面看的状态 ----------
     @property

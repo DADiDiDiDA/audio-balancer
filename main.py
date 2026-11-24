@@ -132,10 +132,18 @@ def build_tray(config, stop):
 def watch_show_event(stop):
     """双击 exe / 托盘打开：核心已存在时拉起界面。"""
     h = ipc.create_event(ipc.EV_SHOW_UI)
+    if not h:
+        # 句柄创建失败时 WaitForSingleObject(0, ...) 会立刻返回 WAIT_FAILED，
+        # 这个循环会变成 100% 占一个核的空转，日志里还什么线索都没有
+        log("无法创建「显示界面」事件，双击 exe 拉起界面的功能不可用")
+        return
     k32 = ctypes.windll.kernel32
     while not stop.is_set():
-        if k32.WaitForSingleObject(h, 200) == 0:
+        rc = k32.WaitForSingleObject(h, 200)
+        if rc == 0:
             spawn_ui()
+        elif rc != 0x102:      # WAIT_TIMEOUT 之外的异常状态：别空转
+            stop.wait(1.0)
 
 
 PHASE = {"name": "idle", "since": time.time()}
@@ -259,6 +267,16 @@ def control_loop(config, engine, muter, guard, stop, icon=None):
             log("控制循环异常：\n" + traceback.format_exc())
         stop.wait(0.3)
 
+    # 退出：在本线程还原音量。主线程调 restore() 会跨线程碰 STA 的会话对象
+    # （RPC_E_WRONG_THREAD 被 except 吞掉），上一轮 SetMasterVolume(0) 就残留在系统里。
+    try:
+        muter.restore()
+    except Exception:
+        pass
+    muter.in_game = False
+    muter.controlled = 0
+    muter.muted = []
+
 
 def watchdog(guard, stop):
     """盯住控制线程：卡在哪一步、卡了多久，直接写进日志。"""
@@ -310,8 +328,9 @@ def main():
     if icon is not None:
         threading.Thread(target=icon.run, daemon=True).start()
     threading.Thread(target=watch_show_event, args=(stop,), daemon=True).start()
-    threading.Thread(target=control_loop,
-                     args=(config, engine, muter, guard, stop, icon), daemon=True).start()
+    ctl = threading.Thread(target=control_loop,
+                           args=(config, engine, muter, guard, stop, icon), daemon=True)
+    ctl.start()
     threading.Thread(target=watchdog, args=(guard, stop), daemon=True).start()
 
     ensure_com()
@@ -329,11 +348,15 @@ def main():
         ipc.set_event(ipc.EV_UI_QUIT)
         stop.set()
         try:
+            ctl.join(timeout=3.0)       # 等控制线程把音量还回去再退出
+        except Exception:
+            pass
+        try:
             guard.stop()
         except Exception:
             pass
         try:
-            muter.restore()
+            muter.restore()             # 兜底：控制线程没跑到收尾时
         except Exception:
             pass
         engine.stop()

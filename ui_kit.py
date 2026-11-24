@@ -408,6 +408,18 @@ class Painter:
         sl.on_change = lambda v, _r=real, _s=show: (_r(v), _s(v))
         return sl
 
+    def _track(self, widget):
+        """登记 create_window 里的真实控件：canvas.delete("all") 只删画布图元，
+        不会销毁这些 Tk 控件，不主动 destroy 就会在每次重绘后永久留在 Tcl 里。"""
+        lst = getattr(self.cv, "_embedded", None)
+        if lst is None:
+            lst = []
+            try:
+                self.cv._embedded = lst
+            except Exception:
+                return
+        lst.append(widget)
+
     def entry(self, x, y, w, h, var, on_commit=None, show=None):
         shape(self.cv, x, y, w, h, 9, fill=self.pal["card2"], outline=self.pal["line"])
         e = tk.Entry(self.cv, textvariable=var, bd=0, relief="flat",
@@ -424,6 +436,7 @@ class Painter:
                 on_commit()
         e.bind("<Return>", commit)
         e.bind("<FocusOut>", commit)
+        self._track(e)
         return e
 
     def listbox(self, x, y, w, h, font_size=10):
@@ -434,4 +447,5 @@ class Painter:
                         activestyle="none", font=(FONT, font_size),
                         exportselection=False)
         self.cv.create_window(x, y, window=lb, anchor="nw", width=int(w), height=int(h))
+        self._track(lb)
         return lb
