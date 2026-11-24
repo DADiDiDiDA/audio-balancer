@@ -324,3 +324,15 @@ python -m PyInstaller 音频均衡器.spec --noconfirm --clean
 - 界面名单：显示、添加、恢复默认都 `sorted(key=str.lower)`；删除用 listbox 里的名字集合，
   不再用索引（显示顺序和配置顺序可以不同）。
 - 回归：`verify_persist.py`（配置 11 项 + 静音 8 项）、`_audit_buttons.py`（25 项）。
+
+### v1.8.3 第二轮代码核对补记
+
+- **`Muter.tick` 的前台分支**：`target = base * fg_vol`，`base` 是该会话记录的原始音量
+  （没有记录时用当前音量）。以前 `target = fg_vol`（默认 1.0），会把用户手动调到 30%
+  的程序硬拉回 100%。同理，如果算出来的 target 与当前值只差 ≤0.005，**不要记录 `_orig`**
+  直接放手——否则退出时反而会去动一个本来没被接管的程序。
+- `_orig_key()` 迁移后要把新键补进 `seen`，否则 tick 末尾的 `_vol` 清理会把它当「本轮没见过」删掉。
+- **`Config.load()` 跳过 `_dirty_keys`**：本进程还没落盘的改动优先，避免热重载把
+  设备守护刚设好的 `output_device` 盖回磁盘旧值。
+- `_on_autostart` 失败时 `after(10, self.render)`：开关视觉已经翻过去，不重画会一直显示错的状态。
+- 回归：`verify_persist.py` 扩到 25 项（新增前台音量 4 项、热重载 2 项）。

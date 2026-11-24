@@ -228,8 +228,16 @@ class Muter:
             # 进程名比对外加 PID 比对：同名程序、以及靠启动器拉起的游戏都能认准
             is_foreground = bool(name) and (name == self.foreground
                                             or s.ProcessId == self._fg_pid)
+            okey = self._orig_key(s, name)
+            if okey:
+                key = okey               # 会话标识变过：后面的记录都用迁移后的键
+                seen.add(key)            # 迁移后的键也算「本轮见过」，否则会被末尾清理掉
             if listed and is_foreground:
-                target = fg_vol          # 在前台：保持正常音量
+                # 在前台：回到「用户自己设的音量」，再乘上这里配的比例。
+                # 以前直接用 fg_vol（默认 100%），会把用户手动调到 30% 的游戏
+                # 硬拉回 100% —— 听起来就是「程序自己在改我的音量」。
+                base = self._orig[key][0] if key in self._orig else raw
+                target = base * fg_vol
             elif listed and mute_bg_listed and not fg_uncertain:
                 target = bg_vol          # 在后台（最小化/挂机）：静音它自己
             elif self.in_game and mute_others:
@@ -238,10 +246,9 @@ class Muter:
                 # 不在处理范围：如果我们之前动过，还原一次，然后完全放手。
                 # 以前会把 target 设成"记录的原始音量"，于是用户手动把音量调小
                 # 之后，音量条会被一点点拉回去（看起来像自己在跳）。
-                okey = self._orig_key(s, name)
-                if okey:
-                    orig = self._orig.pop(okey)[0]
-                    self._vol.pop(okey, None)
+                if key in self._orig:
+                    orig = self._orig.pop(key)[0]
+                    self._vol.pop(key, None)
                     try:
                         if abs(raw - orig) > 0.005:
                             s.SimpleAudioVolume.SetMasterVolume(orig, None)
@@ -251,6 +258,10 @@ class Muter:
 
             last = self._vol.get(key)
             if key not in self._orig:
+                if abs(target - raw) <= 0.005:
+                    # 不需要改它（例如前台 100%、用户本来就是这个音量）：
+                    # 完全放手，连「接管记录」都不留，避免退出时反而去动它
+                    continue
                 # 只有真的要改它时才记原值，避免把没动过的程序也记下来
                 self._orig[key] = (raw, int(getattr(s, "ProcessId", 0) or 0), name)
             elif last is not None and abs(raw - last) > 0.05:

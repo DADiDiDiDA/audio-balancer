@@ -1216,6 +1216,9 @@ class AppWindow:
         self._set_foot("开机自启已开启" if ok and on else
                        ("开机自启已关闭" if ok else "开机自启设置失败"),
                        self.pal["sub"] if ok else self.pal["err"], hold=4.0)
+        if not ok:
+            # 写注册表失败时开关已经翻过去了，不重画会一直显示错误的状态
+            self.root.after(10, self.render)
 
     def _on_block(self, v):
         """缓冲改动要重建会话才生效；拖动时别每格都重连，停手 0.6 秒再应用。"""

@@ -182,6 +182,48 @@ for i in range(2, 60):           # 约 5.8 秒，5 个时间常数后应基本�
 check("渐变大约 5 个时间常数后收敛到位", s.SimpleAudioVolume.v < 0.02,
       s.SimpleAudioVolume.v)
 
+print("== 11) 前台时不覆盖用户自己调的音量 ==")
+m, cfg = make_muter(["game.exe"])
+M.foreground_info = lambda: ("game.exe", live_pid)
+s = FakeSession("game.exe", live_pid, 0.30)
+pump(m, s, base=0)
+check("前台 100% 时保持用户的 30%", abs(s.SimpleAudioVolume.v - 0.30) < 0.01,
+      s.SimpleAudioVolume.v)
+
+m, cfg = make_muter(["game.exe"])
+cfg["mute_fg_volume"] = 0.5
+s = FakeSession("game.exe", live_pid, 0.30)
+pump(m, s, base=0, n=30)
+check("前台配 50% 时按用户的 30% 缩放", abs(s.SimpleAudioVolume.v - 0.15) < 0.02,
+      s.SimpleAudioVolume.v)
+
+m, cfg = make_muter(["game.exe"])
+M.foreground_info = lambda: ("other.exe", 424242)
+s = FakeSession("game.exe", live_pid, 0.30)
+pump(m, s, base=0)
+check("后台先压到 0", s.SimpleAudioVolume.v < 0.01, s.SimpleAudioVolume.v)
+M.foreground_info = lambda: ("game.exe", live_pid)
+pump(m, s, base=100, n=30)
+check("回前台恢复成 30% 而不是 100%", abs(s.SimpleAudioVolume.v - 0.30) < 0.01,
+      s.SimpleAudioVolume.v)
+
+print("== 12) 热重载不覆盖本进程未落盘的改动 ==")
+d2 = tempfile.mkdtemp(prefix="ab_dirty_")
+p2 = os.path.join(d2, "config.json")
+a = Config(p2)
+a.save_now()                 # 先让磁盘上有一份完整配置
+a.set("output_device", "新耳机")   # 本进程改了但还没落盘
+# 模拟界面进程此刻写入了另一份配置（不含新耳机）
+a2 = Config(p2)
+a2.set("target_lufs", -21.0)
+a2.save_now()
+a.load()
+check("未落盘的设备改动没被热重载覆盖",
+      a.get("output_device") == "新耳机", a.get("output_device"))
+check("别的键仍跟着磁盘更新", a.get("target_lufs") == -21.0, a.get("target_lufs"))
+
+M.foreground_info = lambda: ("other.exe", 424242)
+
 print()
 print(f"通过 {PASS} · 失败 {FAIL}")
 sys.exit(1 if FAIL else 0)

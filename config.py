@@ -150,6 +150,11 @@ class Config:
                     for k, v in data.items():
                         if k not in DEFAULTS:
                             continue
+                        if k in self._dirty_keys:
+                            # 本进程有还没落盘的改动：以内存为准。
+                            # 否则设备守护刚把 output_device 改好，界面又写了一次配置，
+                            # 热重载会把这边的改动盖回磁盘上的旧值。
+                            continue
                         v = _coerce(DEFAULTS[k], v)
                         if v is None:
                             # 类型不对就保留默认值，并记下来让界面提示
