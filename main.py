@@ -165,6 +165,8 @@ def control_loop(config, engine, muter, guard, stop, icon=None):
     last_write = 0.0
     last_paused = None
     rdp_restored = False
+    last_muted = ()
+    was_muted = False
     devices = {"inputs": [], "outputs": []}
     try:
         mtime = os.path.getmtime(config.path)
@@ -203,6 +205,18 @@ def control_loop(config, engine, muter, guard, stop, icon=None):
                     log("回到本机会话：恢复接管声音")
                 set_phase("muter.tick")
                 muter.tick(time.time())
+                # 静音名单变化记一行：出现「明明在前台却没声音」时，
+                # 日志里能直接看到是哪一拍压了谁，不用靠猜。
+                muted_now = tuple(muter.muted or [])
+                if muted_now != last_muted:
+                    last_muted = muted_now
+                    if muted_now:
+                        log("自动静音：压低 %s（前台 %s）"
+                            % ("、".join(muted_now), muter.foreground or "?"))
+                    elif was_muted:
+                        log("自动静音：已全部恢复（前台 %s）"
+                            % (muter.foreground or "?"))
+                    was_muted = bool(muted_now)
             set_phase("idle")
 
             err = engine.status.get("error")

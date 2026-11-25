@@ -21,7 +21,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 
 SIDE_W = 192
 

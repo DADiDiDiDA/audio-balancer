@@ -92,16 +92,16 @@ class FakeSession:
 
 
 class FakeCfg:
-    def __init__(self, d): self.d = d
+    def __init__(self, d, path=""): self.d = d; self.path = path
     def snapshot(self): return dict(self.d)
     def get(self, k, default=None): return self.d.get(k, default)
 
 
-def make_muter(games):
+def make_muter(games, cfg_path=""):
     cfg = {"mute_enabled": True, "mute_games": list(games), "mute_ignore": [],
            "mute_listed_in_background": True, "mute_others_in_game": False,
            "mute_fg_volume": 1.0, "mute_bg_volume": 0.0, "mute_easing_ms": 200}
-    m = M.Muter(FakeCfg(cfg))
+    m = M.Muter(FakeCfg(cfg, cfg_path))
     m._self_pid = 999999
     return m, cfg
 
@@ -221,6 +221,63 @@ a.load()
 check("未落盘的设备改动没被热重载覆盖",
       a.get("output_device") == "新耳机", a.get("output_device"))
 check("别的键仍跟着磁盘更新", a.get("target_lufs") == -21.0, a.get("target_lufs"))
+
+M.foreground_info = lambda: ("other.exe", 424242)
+
+print("== 13) 残留的 0 不算用户音量（前台必须能出声）==")
+M.foreground_info = lambda: ("mumunxdevice.exe", live_pid)
+m, cfg = make_muter(["mumunxdevice.exe"])
+s = FakeSession("mumunxdevice.exe", live_pid, 0.0)   # Windows 记住了上次被压的 0
+pump(m, s, base=0)
+check("前台残留 0 会恢复到可听音量", s.SimpleAudioVolume.v > 0.9,
+      s.SimpleAudioVolume.v)
+
+m, cfg = make_muter(["mumunxdevice.exe"])
+s = FakeSession("mumunxdevice.exe", live_pid, 0.0)
+M.foreground_info = lambda: ("other.exe", 424242)
+pump(m, s, base=0)
+M.foreground_info = lambda: ("mumunxdevice.exe", live_pid)
+pump(m, s, base=100)
+check("后台静音后回前台一定有声", s.SimpleAudioVolume.v > 0.9,
+      s.SimpleAudioVolume.v)
+
+print("== 14) 重启均衡器后仍能认出「那个 0 是我们压的」==")
+d3 = tempfile.mkdtemp(prefix="ab_state_")
+state = os.path.join(d3, "mute_state.json")
+with open(state, "w", encoding="utf-8") as f:
+    json.dump({"volumes": {"mumunxdevice.exe": 0.7}}, f)
+m, cfg = make_muter(["mumunxdevice.exe"], os.path.join(d3, "config.json"))
+s = FakeSession("mumunxdevice.exe", live_pid, 0.0)
+M.foreground_info = lambda: ("mumunxdevice.exe", live_pid)
+pump(m, s, base=0)
+check("按状态文件恢复成用户原来的 0.7", abs(s.SimpleAudioVolume.v - 0.7) < 0.02,
+      s.SimpleAudioVolume.v)
+
+# 状态文件本身：压过就写、恢复后不会被清空
+m, cfg = make_muter(["foo.exe"], os.path.join(d3, "config.json"))
+M.foreground_info = lambda: ("other.exe", 424242)
+s = FakeSession("foo.exe", live_pid, 0.45)
+m._last_save = 0.0
+pump(m, s, base=1000, n=6)
+saved = json.load(open(state, encoding="utf-8"))["volumes"]
+check("被压过的程序原音量写进状态文件", abs(saved.get("foo.exe", 0) - 0.45) < 0.01,
+      saved)
+cfg["mute_games"] = []
+pump(m, s, base=2000, n=6)
+saved2 = json.load(open(state, encoding="utf-8"))["volumes"]
+check("恢复后状态文件里的记录不丢", "foo.exe" in saved2, saved2)
+check("恢复成 0.45", abs(s.SimpleAudioVolume.v - 0.45) < 0.02, s.SimpleAudioVolume.v)
+
+print("== 15) 原音量永远不记成 0 ==")
+m, cfg = make_muter(["foo.exe"])
+M.foreground_info = lambda: ("other.exe", 424242)
+s = FakeSession("foo.exe", live_pid, 0.0)      # 已经是 0
+pump(m, s, base=0)
+recs = list(m._orig.values())
+check("会话是 0 时不把 0 当原值", all(r[0] > 0.9 for r in recs) or not recs, recs)
+M.foreground_info = lambda: ("foo.exe", live_pid)
+pump(m, s, base=100)
+check("切前台后有声音", s.SimpleAudioVolume.v > 0.9, s.SimpleAudioVolume.v)
 
 M.foreground_info = lambda: ("other.exe", 424242)
 

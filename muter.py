@@ -14,6 +14,7 @@
 """
 import ctypes
 import ctypes.wintypes  # noqa: F401  （显式导入，别依赖其它库顺手加载）
+import json
 import math
 import os
 
@@ -49,6 +50,23 @@ def _num(cfg, key, default, lo, hi):
     if not math.isfinite(v):
         v = float(default)
     return max(float(lo), min(float(hi), v))
+
+
+def _user_vol(raw):
+    """把「接管前的音量」规整成用户真正的意图。
+
+    0 不能当原值：那多半是**我们自己**压下去的（或者上一个版本压成 0 之后
+    Windows 把它记住了）。把 0 记成原值，前台恢复算出来还是 0，表现就是
+    「模拟器切到前台也没声音」，而且重启程序也救不回来。取不到/为 0 时
+    一律当 1.0 处理。
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(v) or v <= 0.01:
+        return 1.0
+    return min(1.0, v)
 
 
 def foreground_info():
@@ -89,6 +107,63 @@ class Muter:
         self.controlled = 0
         self.muted = []          # 正在被压低的程序名（界面显示用）
         self.error = None
+        # 上次被我们压过的程序 -> 它原本的音量。只存内存不够：均衡器重启后
+        # 会话可能还停在 0（Windows 会记住每个程序的应用音量），此时既没有
+        # 接管记录、又把 0 当成用户意图，前台也恢复不了 —— 就是「模拟器前台
+        # 也没声音」。所以按进程名落一份小状态，重启后能认出来并还原。
+        self._saved = {}
+        self._saved_written = {}
+        self._last_save = 0.0
+        self._load_saved()
+
+    # ---------- 原音量状态（跨进程重启保留） ----------
+    def _state_path(self):
+        try:
+            base = os.path.dirname(str(self.config.path))
+        except Exception:
+            return ""
+        return os.path.join(base, "mute_state.json") if base else ""
+
+    def _load_saved(self):
+        p = self._state_path()
+        if not p:
+            return
+        try:
+            with open(p, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            vols = data.get("volumes") if isinstance(data, dict) else None
+            if isinstance(vols, dict):
+                self._saved = {str(k).lower(): _user_vol(v) for k, v in vols.items()}
+                self._saved_written = dict(self._saved)
+        except Exception:
+            self._saved = {}
+
+    def _remember(self, now):
+        """把「进程名 -> 原音量」写盘（最多 5 秒一次，内容没变不写）。
+
+        以已写过的内容为底再叠加：restore() 会清空 `_orig`，若直接整份覆盖，
+        刚恢复完就把记录写没了，下次启动又认不出「那些 0 是我们压的」。
+        """
+        cur = dict(self._saved_written)
+        for rec in self._orig.values():
+            name, orig = rec[2], _user_vol(rec[0])
+            if name:
+                cur[name] = orig
+        if cur == self._saved_written or now - self._last_save < 5.0:
+            return
+        p = self._state_path()
+        if not p:
+            return
+        try:
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"volumes": cur}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+            self._saved_written = dict(cur)
+            self._saved = dict(cur)
+            self._last_save = now
+        except Exception:
+            pass
 
     def _enum(self):
         out = []
@@ -232,11 +307,18 @@ class Muter:
             if okey:
                 key = okey               # 会话标识变过：后面的记录都用迁移后的键
                 seen.add(key)            # 迁移后的键也算「本轮见过」，否则会被末尾清理掉
+            if (listed and key not in self._orig and name
+                    and raw <= 0.01 and name in self._saved):
+                # 上一次运行把它压成了 0，Windows 也把这个 0 记住了（程序重启
+                # 后会话音量还是 0）。原值从状态文件里取回来，否则前台也算 0。
+                self._orig[key] = (self._saved[name],
+                                   int(getattr(s, "ProcessId", 0) or 0), name)
             if listed and is_foreground:
                 # 在前台：回到「用户自己设的音量」，再乘上这里配的比例。
                 # 以前直接用 fg_vol（默认 100%），会把用户手动调到 30% 的游戏
                 # 硬拉回 100% —— 听起来就是「程序自己在改我的音量」。
-                base = self._orig[key][0] if key in self._orig else raw
+                base = (_user_vol(self._orig[key][0]) if key in self._orig
+                        else _user_vol(raw))
                 target = base * fg_vol
             elif listed and mute_bg_listed and not fg_uncertain:
                 target = bg_vol          # 在后台（最小化/挂机）：静音它自己
@@ -263,10 +345,10 @@ class Muter:
                     # 完全放手，连「接管记录」都不留，避免退出时反而去动它
                     continue
                 # 只有真的要改它时才记原值，避免把没动过的程序也记下来
-                self._orig[key] = (raw, int(getattr(s, "ProcessId", 0) or 0), name)
+                self._orig[key] = (_user_vol(raw), int(getattr(s, "ProcessId", 0) or 0), name)
             elif last is not None and abs(raw - last) > 0.05:
                 # 用户自己拖了音量条：以他的新值为基准，别再拉回旧值
-                self._orig[key] = (raw, int(getattr(s, "ProcessId", 0) or 0), name)
+                self._orig[key] = (_user_vol(raw), int(getattr(s, "ProcessId", 0) or 0), name)
 
             cur = last if last is not None else raw
             new = cur + (target - cur) * alpha
@@ -295,6 +377,7 @@ class Muter:
             self._orig = {k: v for k, v in self._orig.items() if k in seen}
         self.controlled = controlled
         self.muted = list(dict.fromkeys(muted))[:5]
+        self._remember(now)
 
     def restore(self):
         for s in self._sessions or self._enum():
@@ -310,7 +393,7 @@ class Muter:
                 okey = self._orig_key(s, name)
                 if not okey:
                     continue
-                orig = self._orig[okey][0]
+                orig = _user_vol(self._orig[okey][0])
                 # 当前值已经不等于我们上次写入的值 → 用户自己调过，别覆盖
                 last = self._vol.get(okey)
                 try:
