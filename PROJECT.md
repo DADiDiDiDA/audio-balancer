@@ -368,7 +368,23 @@ python -m PyInstaller 音频均衡器.spec --noconfirm --clean
   探出 `(row_px, base_px)`，`list_h = base_px + rows*row_px`；直接按剩余空间给像素高度
   会把最后一行切成半个。
 - 新增 `procdesc.py`：进程名 → `FileDescription`（退回 `ProductName` → exe 所在目录名），
-  20 秒缓存；`FileDescription` 通常才是「MuMu模拟器」这种友好名，`ProductName` 常是
+  20 秒缓存；再把「见过的 exe 路径 + 说明」写进 `procdesc_cache.json`（与 config 同目录），
+  程序没启动时也能显示它是什么（最多 5 分钟写一次盘）；`FileDescription` 通常才是「MuMu模拟器」这种友好名，`ProductName` 常是
   「Microsoft® Windows® Operating System」这类通用串。**备注优先于自动识别**。
 - 回归：`verify_persist.py` 44 项（单程序音量 3 / 强制模式 4 / 只剩一条规则 4）；
   `_audit_buttons.py` 33 项（备注、用默认值、强制开关、删除按原始名、行内百分比）。
+
+### v1.8.6 补记：名单表格化 + 两个「看着生效其实没有」的坑
+
+- 名单从纯文本行改成表格观感：斑马纹 `Listbox.itemconfig(background=...)`、`<Motion>` 悬停
+  高亮（`_hover_row`）、百分比右对齐成列。右对齐不能用字符数补空格（中英文宽度差很多），
+  必须 `ui_kit.text_width()` 量出实际宽度再算补几个空格。
+- **没选中时拖前台音量滑块**：以前只弹一句提示，滑块却停在拖到的位置，看起来像设好了。
+  现在 `_on_pick_fg` 发现没选中就 `after(30, self._sync_pick)` 弹回真实值。
+- **删除程序**：`_del_game` 同时把 `mute_fg_map` / `mute_note_map` 里对应的键删掉，
+  否则删掉的程序会在配置里留下永远用不到的条目。
+- 选中项设置放进淡色面板（`theme.alpha_on(accent, card2, 0.07)`），和列表在视觉上分开；
+  面板高度固定 92px，`foot_h=132`，所以列表行数不变。
+- `_list_metrics()` 结果按 Tk `scaling` 缓存到类属性，重绘不再每次都建两个探针 Listbox。
+- 空名单显示一行提示（不是空白的白框），`_rows` 保持为空，避免选中/删除拿到假名字。
+- 回归：`_audit_buttons.py` 39 项（新增空名单、没选中拖滑块不写盘、删除清配置、百分比成列）。

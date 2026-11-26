@@ -23,3 +23,7 @@ config.json
 # 架构拆分后的状态文件与旧入口备份
 .audiobalancer_status.json
 *_old.py.txt
+
+# 运行现场：程序识别缓存 / 静音状态（含本机路径，绝不入库）
+procdesc_cache.json
+mute_state.json

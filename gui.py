@@ -8,6 +8,7 @@ ui_kit 用 PIL 形状 + Canvas 文本画出来，所以圆角抗锯齿、hover �
 增益、状态、保存状态）只改文字和坐标，不重建 —— 否则拖滑块会被打断。
 """
 import math
+import os
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -22,7 +23,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 
 SIDE_W = 192
 
@@ -679,43 +680,49 @@ class AppWindow:
 
         # ---- 名单 ----
         gy = cy + ch + 12
-        head, foot_h = 52, 130
+        head, foot_h = 52, 132
         row_px, base_px = self._list_metrics()
         avail = int(H - gy - 8 - head - foot_h)
         rows = max(3, (avail - base_px) // max(1, row_px))
         list_h = base_px + rows * row_px          # 正好整行，不留半行
         gh = head + list_h + foot_h
         p.card(x, gy, w, gh)
-        p.section(x + 22, gy + 26, "名单", "进程名 · 是什么程序 · 前台音量",
-                  right=x + w - 22,
+        p.section(x + 22, gy + 26, "名单", None,
                   tip="只认这里的程序（不区分大小写）。选中一行，下面能单独改它在前台时的音量，"
                       "也能写一句备注，方便记住这串进程名到底是谁。")
+        self.m_sum = p.text(x + w - 22, gy + 26, "", 9, pal["dim"], anchor="e")
+        self._list_width = w - 48
         lb = p.listbox(x + 24, gy + head, w - 48, list_h)
+        lb.configure(activestyle="none")
         self.m_list = lb
         lb.bind("<<ListboxSelect>>", lambda e: self._sync_pick())
+        lb.bind("<Motion>", self._on_list_motion)
+        lb.bind("<Leave>", lambda e: self._hover_row(-1))
         self.m_note_var = tk.StringVar(master=self.root, value="")
         # 编辑控件还没画出来：先清空引用，免得 _fill_list 摸到上一轮已删除的图元
         self.m_pick_lbl = None
         self.m_pick_fg = None
+        self._hover_idx = None
         self._fill_list()
 
-        # ---- 选中项的单独设置 ----
+        # ---- 选中项的单独设置：整块淡色面板，和列表分开 ----
         ey = gy + head + list_h + 8
-        p.divider(x + 22, ey - 6, w - 44)
-        self.m_pick_lbl = p.text(x + 22, ey + 10, "未选中", 10, pal["sub"])
-        p.button(x + w - 22 - 84, ey + 2, 84, 26, "用默认值",
+        ui_kit.shape(p.cv, x + 12, ey - 6, w - 24, 92, 14,
+                     fill=theme.alpha_on(pal["accent"], pal["card2"], 0.07))
+        self.m_pick_lbl = p.text(x + 30, ey + 10, "未选中", 10)
+        p.button(x + w - 30 - 84, ey + 2, 84, 26, "用默认值",
                  self._reset_pick_fg, kind="ghost")
-        self.m_pick_fg = p.field(x + 22, ey + 34, 236, "前台音量",
+        self.m_pick_fg = p.field(x + 30, ey + 32, 206, "前台音量",
                                  self._fg_of(self._pick_game()), 0, 1, 0.05,
                                  self._on_pick_fg,
                                  fmt=lambda v: "%.0f%%" % (v * 100),
                                  tip="只对这个程序生效，默认跟随上面的「默认前台音量」")
-        p.text(x + 286, ey + 56, "备注", 10, pal["sub"])
-        p.entry(x + 322, ey + 44, 220, 30, self.m_note_var, self._save_note)
-        p.button(x + 550, ey + 44, 78, 30, "保存备注", self._save_note,
+        p.text(x + 258, ey + 54, "备注", 10, pal["sub"])
+        p.entry(x + 294, ey + 42, 250, 30, self.m_note_var, self._save_note)
+        p.button(x + 552, ey + 42, 78, 30, "保存备注", self._save_note,
                  kind="soft")
 
-        ry = ey + 88
+        ry = ey + 94
         p.entry(x + 22, ry, 202, 32, self.var_newgame, self._add_game)
         p.button(x + 232, ry, 62, 32, "添加", self._add_game)
         p.button(x + 302, ry, 88, 32, "删除选中", self._del_game, kind="ghost")
@@ -731,6 +738,13 @@ class AppWindow:
         再按整行数算高度。
         """
         try:
+            scaling = float(self.root.tk.call("tk", "scaling"))
+        except Exception:
+            scaling = 1.0
+        cached = getattr(AppWindow, "_row_metrics", None)
+        if cached and cached[0] == scaling:
+            return cached[1], cached[2]
+        try:
             one = tk.Listbox(self.root, font=(FONT, 10), height=1)
             h1 = one.winfo_reqheight()
             one.destroy()
@@ -738,6 +752,7 @@ class AppWindow:
             h2 = two.winfo_reqheight()
             two.destroy()
             row = max(10, h2 - h1)
+            AppWindow._row_metrics = (scaling, row, max(0, h1 - row))
             return row, max(0, h1 - row)
         except Exception:
             return 24, 4
@@ -1295,39 +1310,109 @@ class AppWindow:
     # ---- 名单 ----
     def _fill_list(self):
         lb = getattr(self, "m_list", None)
+        old = getattr(self, "_rows", []) or []
+        self._rows = []
         if lb is None:
             return
-        rows = getattr(self, "_rows", [])
         try:
-            keep = {rows[i] for i in lb.curselection() if i < len(rows)}
+            keep = {old[i] for i in lb.curselection() if i < len(old)}
         except Exception:
             keep = set()
         try:
             lb.delete(0, "end")
             games = sorted(self.config.get("mute_games", []) or [], key=str.lower)
-            info = procdesc.describe(games)
+            info = procdesc.describe(
+                games, cache_dir=os.path.dirname(self.config.path))
             notes = self.config.get("mute_note_map") or {}
             fg_map = self.config.get("mute_fg_map") or {}
-            default = float(self.config.get("mute_fg_volume", 1.0) or 1.0)
+            try:
+                default = float(self.config.get("mute_fg_volume", 1.0))
+            except (TypeError, ValueError):
+                default = 1.0
             self._rows = list(games)
+            if not games:
+                lb.insert("end", "  名单是空的：在下面填进程名后点「添加」")
+                self._fill_summary(0, 0)
+                self._sync_pick()
+                return
             for i, g in enumerate(games):
                 low = g.lower()
                 desc = str(notes.get(low, "") or "").strip()
                 if not desc:
                     desc = (info.get(low) or {}).get("text", "")
-                desc = desc[:26]
+                if desc == "未运行":      # 没识别出来就留空，比刷 20 行「未运行」干净
+                    desc = ""
                 v = fg_map.get(low)
                 try:
                     pct = int(round((float(v) if v is not None else default) * 100))
                 except (TypeError, ValueError):
                     pct = 100
-                tail = ("  ·  " + desc) if desc else ""
-                lb.insert("end", "%s%s  ·  %d%%" % (g, tail, pct))
+                lb.insert("end", self._row_text(g, desc[:26], pct))
+                lb.itemconfig(i, background=self._row_bg(i))
                 if g in keep:
                     lb.selection_set(i)
+            self._fill_summary(
+                len(games), sum(1 for g in games if g.lower() in fg_map))
         except Exception:
             pass
         self._sync_pick()
+
+    def _row_text(self, name, desc, pct):
+        """一行：进程名 · 是什么程序 ……… 100%。
+
+        百分比要右对齐成一列。中英文混排宽度差很多，按字符数补空格会歪，
+        这里按实际像素宽度算要补几个空格。
+        """
+        left = name + (("  ·  " + desc) if desc else "")
+        pct_s = "%d%%" % pct
+        width = max(260, getattr(self, "_list_width", 640) - 16)
+        try:
+            space = max(3, ui_kit.text_width(" ", 10))
+            gap = (width - ui_kit.text_width(pct_s, 10)
+                   - ui_kit.text_width(left, 10)) // space
+        except Exception:
+            gap = 2
+        return left + " " * max(2, int(gap)) + pct_s
+
+    def _row_bg(self, i, hover=False):
+        """斑马纹 + 悬停底色：列表不至于糊成一片。"""
+        pal = self.pal
+        if hover:
+            return theme.mix(pal["card2"], pal["accent"], 0.12)
+        return theme.alpha_on(pal["text"], pal["card2"], 0.05) if i % 2 else pal["card2"]
+
+    def _fill_summary(self, n, k):
+        txt = ("%d 个程序" % n) + (("  ·  %d 个单独设置" % k) if k else "")
+        try:
+            if self.m_sum is not None:
+                self._painter.cv.itemconfigure(self.m_sum, text=txt or "")
+        except Exception:
+            pass
+
+    def _on_list_motion(self, ev):
+        try:
+            idx = ev.widget.nearest(ev.y)
+        except Exception:
+            return
+        self._hover_row(idx)
+
+    def _hover_row(self, idx):
+        lb = getattr(self, "m_list", None)
+        if lb is None:
+            return
+        prev = getattr(self, "_hover_idx", None)
+        if prev == idx:
+            return
+        self._hover_idx = idx
+        try:
+            sel = set(lb.curselection())
+        except Exception:
+            sel = set()
+        for i in {x for x in (prev, idx) if x is not None and x >= 0}:
+            try:
+                lb.itemconfig(i, background=self._row_bg(i, hover=(i == idx and i not in sel)))
+            except Exception:
+                pass
 
     def _pick_game(self):
         """当前选中的进程名；没选中返回空串。"""
@@ -1384,7 +1469,10 @@ class AppWindow:
     def _on_pick_fg(self, v):
         name = self._pick_game()
         if not name:
+            # 滑块在没选中时也能拖，但那样改了不落盘。直接弹回真实值，
+            # 免得看着「设好了」其实没生效。
             self._set_foot("先在名单里选一个程序", self.pal["warn"], hold=2.5)
+            self.root.after(30, self._sync_pick)
             return
         fg_map = dict(self.config.get("mute_fg_map") or {})
         fg_map[name.lower()] = round(float(v), 3)
@@ -1454,6 +1542,15 @@ class AppWindow:
         games = [g for g in (self.config.get("mute_games", []) or [])
                  if g not in picked]
         self._set("mute_games", sorted(games, key=str.lower))
+        # 名单里没有的程序不该再留单独设置 / 备注，否则配置会越攒越脏
+        lows = {g.lower() for g in picked}
+        for key in ("mute_fg_map", "mute_note_map"):
+            cur = dict(self.config.get(key) or {})
+            drop = [k for k in cur if k in lows]
+            if drop:
+                for k in drop:
+                    cur.pop(k, None)
+                self._set(key, cur)
         # 核心进程每 0.3 秒按新名单 tick 一次，被删掉的程序会自动还原音量
         self._fill_list()
 
