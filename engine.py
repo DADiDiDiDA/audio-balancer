@@ -290,6 +290,37 @@ def desired_gain(mode, target, rng, lufs, max_att, max_boost,
     return gain
 
 
+def agc_step(state, desired, warm, dt, attack, release, auto):
+    """把「目标增益」平滑成当前增益，返回新增益（state 里存 gain / fresh）。
+
+    为什么要有 fresh（v1.8.8）：
+      以前启动和「静音后恢复」都把 gain 归零，并且升温期前 0.4 秒强制不处理
+      （desired = 0）。遇到正常响度以上的内容（多数音乐/游戏都在 -12 LUFS 上下），
+      输出会先按 0 dB 原样放 0.4 秒，再花 120ms 压到 -6 ~ -8 dB —— 听感就是
+      「刚打开程序 / 刚有声音时音量偏大一下，然后才正常」。
+
+      现在：启动与恢复时把 gain 保留成「上次的衰减值」（绝不为正），并置 fresh；
+      第一段真正有声的音频如果算出来要衰减，就直接落位（块内线性过渡，没有台阶），
+      不再先响 0.4 秒；要提升时仍然走慢释放，不会突然变响。
+    """
+    gain = float(state.get("gain", 0.0))
+    if state.get("fresh"):
+        if desired < gain - 1e-9:
+            state["gain"] = float(desired)
+            state["fresh"] = False
+            return float(desired)
+        if warm >= 0.4:
+            # 升温结束都没轮到衰减 → 以后按正常节奏平滑，别一直保留「直落」特权
+            state["fresh"] = False
+    tau = attack if desired < gain else release
+    if auto and desired >= gain:
+        tau = max(tau, 1.2)               # 提上来要慢，避免抽吸感
+    coeff = 1.0 - float(np.exp(-dt / max(tau, 1e-3)))
+    gain = gain + (desired - gain) * coeff
+    state["gain"] = gain
+    return gain
+
+
 class _Out:
     """输出设备包装：优先 RAW 模式（绕过 Nahimic/Voice Clarity 等 APO），
     不支持时回退到 soundcard 的普通共享模式。"""
@@ -554,6 +585,8 @@ class Engine:
         dc = DcBlocker(SR, fc=self._num(cfg, "dc_blocker_hz", 10, 1, 120), channels=CHANNELS)
 
         state = {"gain": 0.0, "lufs": -70.0, "underrun": 0, "warm": 0.0,
+                 # fresh：启动/静音恢复后的第一段音频，允许「要衰减就直接落位」
+                 "fresh": True,
                  "win_vol": 1.0,
                  # Windows 音量：每块都去读端点音量是 200 次/秒 COM 调用，
                  # 改成每 100ms 读一次，人耳完全感觉不到延迟，CPU 省一大截
@@ -752,15 +785,19 @@ class Engine:
                         silent_block = not x.any()
                         quiet = quiet + 1 if silent_block else 0
                         if fast and not silent_block:
-                            # 有声音了：清掉静音期留下的滤波器状态与增益，
-                            # 否则第一个块会带着陈旧状态出现台阶（咔哒/泵一下）
+                            # 有声音了：清掉静音期留下的滤波器状态，
+                            # 否则第一个块会带着陈旧状态出现台阶（咔哒/泵一下）。
+                            # 增益只保留「衰减」部分、绝不保留正增益：
+                            # 归零的话恢复瞬间会先按 0 dB 放出半秒再压回来，
+                            # 听起来就是「一有声音就偏大一下」。
                             fast = False
                             dc.reset()
                             kw.reset()
                             meter.reset()
                             limiter.reset()
                             state["warm"] = 0.0
-                            state["gain"] = 0.0
+                            state["gain"] = min(0.0, float(state["gain"]))
+                            state["fresh"] = True
                         if silent_block and (fast or quiet >= quiet_need):
                             if not fast:
                                 fast = True
@@ -770,7 +807,8 @@ class Engine:
                                 # 清掉前瞻缓冲里的旧音频，别在恢复时吐出一段 2ms 的残响
                                 limiter.reset()
                                 state["warm"] = 0.0
-                                state["gain"] = 0.0
+                                state["gain"] = min(0.0, float(state["gain"]))
+                                state["fresh"] = True
                                 state["lufs"] = -70.0
                             pl.play(zeros)
                             now = time.time()
@@ -841,7 +879,7 @@ class Engine:
                             auto = str(cfg.get("level_mode", "auto")).lower() != "limit"
                             target = self._num(cfg, "target_lufs", -18, -40, -8)
                             max_att = self._num(cfg, "max_attenuation_db", 20, 0, 40)
-                            if not enabled or state["lufs"] < gate or state["warm"] < 0.4:
+                            if not enabled or state["lufs"] < gate:
                                 desired = 0.0
                             else:
                                 # 低电平拐点：比目标低 34dB 以上（默认）完全不提升，
@@ -856,22 +894,19 @@ class Engine:
                                     low_knee=knee,
                                     knee_width=self._num(cfg, "low_knee_width_db",
                                                          10.0, 1.0, 40.0))
+                                if state["warm"] < 0.4:
+                                    # 升温期（测量窗口还没填满）只允许压、不允许提：
+                                    # 以前这段整个按 0 dB 放，响的内容会先大 0.4 秒
+                                    desired = min(0.0, desired)
 
                             attack = self._num(cfg, "gain_attack_ms", 120, 5, 3000) / 1000.0
                             release = self._num(cfg, "gain_release_ms", 900, 50, 8000) / 1000.0
-                            dt = blk / float(SR)
-                            if desired < state["gain"]:
-                                tau = attack                      # 压下去要快
-                            else:
-                                tau = release
-                                if auto:
-                                    tau = max(tau, 1.2)           # 提上来要慢
-                            coeff = 1.0 - float(np.exp(-dt / max(tau, 1e-3)))
-                            state["gain"] += (desired - state["gain"]) * coeff
+                            gain = agc_step(state, desired, state["warm"],
+                                            blk / float(SR), attack, release, auto)
 
                             # 增益按样本线性过渡：块间没有台阶，就不会有拉链噪声
                             y = apply_gain_ramp(
-                                x, pre * float(10.0 ** (state["gain"] / 20.0)) * vol_gain,
+                                x, pre * float(10.0 ** (gain / 20.0)) * vol_gain,
                                 state)
                             # 真峰值限幅（只降增益，不改波形）：天花板按界面上设的
                             # dBTP 走，改了配置立刻生效，不需要重连

@@ -408,3 +408,20 @@ python -m PyInstaller 音频均衡器.spec --noconfirm --clean
 - 添加程序允许直接粘 exe 路径（自动取文件名）；识别不到的会提示「启动后会自动识别」，
   输入框右侧加了「例：MuMuPlayer.exe」。
 - 回归：`_audit_buttons.py` 39 项、`verify_persist.py` 44 项、`_ui_audit.py` 两档尺寸 0 越界。
+
+### v1.8.8 补记：启动/恢复时「音量先大一下」
+
+- 现象：打开程序（或游戏刚开始出声）时，音量会明显偏大一瞬间，随后自己回到正常。
+- 根因在增益升温策略，不在限幅也不在静音：`state["gain"]` 启动为 0 dB，且
+  `state["warm"] < 0.4` 期间把 `desired` 强制成 0（担心测量窗口没填满时误判）。
+  多数内容在 -12 LUFS 上下、目标 -18 LUFS，稳态要压 -6 ~ -8 dB，于是开头 0.4 秒
+  原样放 0 dB（响一倍），再用 120ms attack 压下来 —— 就是「偏大一下」。
+  静音快路径退出时同样把 gain 归零，所以每次「静音→有声」都会重演一次。
+- 改法（`engine.agc_step()` + 两处静音切换）：
+  1) 升温期只允许压、不允许提：`desired = min(0.0, desired)`，不再整段置 0；
+  2) 启动 / 静音恢复时 `gain` 只保留衰减部分（`min(0, gain)`）并置 `state["fresh"]`，
+     第一段有声音频若要衰减就直接落位（块内线性过渡，无台阶），要提升仍走慢释放；
+  3) `apply_gain_ramp` 不变，仍按样本线性过渡。
+- 实测包络（-12 LUFS 内容，10ms 块）：旧策略第 1 块 0.0 dB、0.5 秒才 -3.8 dB；
+  新策略第 1 块 -5.5 dB、0.5 秒 -6.0 dB（稳态），过冲 0.5 dB，人耳不可闻。
+- 回归：新增 `verify_gainstart.py`（7 项，不连设备）；`verify_engine/loudness/limiter/preset/persist` 全绿。
