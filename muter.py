@@ -249,6 +249,9 @@ class Muter:
             self.in_game = False
             self.controlled = 0
             self.muted = []
+            # 关着的时候也把时间点续上：否则重新打开时 dt 是「关掉的整段时间」，
+            # 被夹到 1 秒上限后一步跳到位，听感上是「啪」一下而不是渐变
+            self._last_tick = now
             return
 
         if now - self._last_enum > 3.0:

@@ -23,7 +23,7 @@ import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.6"
+VERSION = "1.8.7"
 
 SIDE_W = 192
 
@@ -691,9 +691,13 @@ class AppWindow:
                   tip="只认这里的程序（不区分大小写）。选中一行，下面能单独改它在前台时的音量，"
                       "也能写一句备注，方便记住这串进程名到底是谁。")
         self.m_sum = p.text(x + w - 22, gy + 26, "", 9, pal["dim"], anchor="e")
-        self._list_width = w - 48
-        lb = p.listbox(x + 24, gy + head, w - 48, list_h)
-        lb.configure(activestyle="none")
+        # 右侧留 6px 给细滚动条：名单通常一屏放不下，没有指示条看不出还能往下翻
+        self._list_width = w - 48 - 12
+        lb = p.listbox(x + 24, gy + head, w - 60, list_h)
+        lb.configure(activestyle="none", yscrollcommand=self._on_list_scroll)
+        self._rail_geo = (x + w - 30, gy + head, list_h)
+        self._rail_ids = None
+        self._list_rail()
         self.m_list = lb
         lb.bind("<<ListboxSelect>>", lambda e: self._sync_pick())
         lb.bind("<Motion>", self._on_list_motion)
@@ -728,6 +732,7 @@ class AppWindow:
         p.button(x + 302, ry, 88, 32, "删除选中", self._del_game, kind="ghost")
         p.button(x + 398, ry, 100, 32, "恢复默认名单", self._reset_games,
                  kind="ghost")
+        p.text(x + 512, ry + 10, "例：MuMuPlayer.exe", 9, pal["dim"])
         self._sync_pick()
 
     def _list_metrics(self):
@@ -756,6 +761,46 @@ class AppWindow:
             return row, max(0, h1 - row)
         except Exception:
             return 24, 4
+
+    def _list_rail(self):
+        """名单右侧的细滚动条（内容一屏放得下时自动隐藏）。
+
+        Tk 的 Listbox 没有滚动条就完全看不出「下面还有」；装一条 4px 的
+        指示条比塞一个原生滚动条干净，也不会破坏卡片圆角。
+        """
+        cv = self._painter.cv
+        x, y, h = self._rail_geo
+        base = self.pal["card2"]
+        track = cv.create_rectangle(
+            x, y, x + 4, y + h, outline="",
+            fill=theme.alpha_on(self.pal["text"], base, 0.05), state="hidden")
+        thumb = cv.create_rectangle(
+            x, y, x + 4, y + h, outline="",
+            fill=theme.alpha_on(self.pal["text"], base, 0.26), state="hidden")
+        self._rail_ids = (track, thumb)
+
+    def _on_list_scroll(self, first, last):
+        """Listbox 的 yscrollcommand：把可见区间画成滚动条滑块。"""
+        ids = getattr(self, "_rail_ids", None)
+        if not ids:
+            return
+        try:
+            first, last = float(first), float(last)
+            track, thumb = ids
+            x, y, h = self._rail_geo
+            cv = self._painter.cv
+            span = max(0.0, min(1.0, last - first))
+            if span >= 0.999:
+                cv.itemconfigure(track, state="hidden")
+                cv.itemconfigure(thumb, state="hidden")
+                return
+            th = max(22.0, h * span)
+            ty = y + (h - th) * (first / max(1e-6, 1.0 - span))
+            cv.itemconfigure(track, state="normal")
+            cv.itemconfigure(thumb, state="normal")
+            cv.coords(thumb, x, ty, x + 4, ty + th)
+        except Exception:
+            pass
 
     def _page_device(self, p, x, y, w, H):
         pal = self.pal
@@ -1319,10 +1364,18 @@ class AppWindow:
         except Exception:
             keep = set()
         try:
+            top = float(lb.yview()[0])
+        except Exception:
+            top = 0.0
+        try:
             lb.delete(0, "end")
             games = sorted(self.config.get("mute_games", []) or [], key=str.lower)
-            info = procdesc.describe(
-                games, cache_dir=os.path.dirname(self.config.path))
+            try:
+                info = procdesc.describe(
+                    games, cache_dir=os.path.dirname(self.config.path))
+            except Exception:
+                # 认不出是什么程序不该把整张名单弄空：没说明就只显示进程名
+                info = {}
             notes = self.config.get("mute_note_map") or {}
             fg_map = self.config.get("mute_fg_map") or {}
             try:
@@ -1333,6 +1386,10 @@ class AppWindow:
             if not games:
                 lb.insert("end", "  名单是空的：在下面填进程名后点「添加」")
                 self._fill_summary(0, 0)
+                try:
+                    self._on_list_scroll(*lb.yview())
+                except Exception:
+                    pass
                 self._sync_pick()
                 return
             for i, g in enumerate(games):
@@ -1353,6 +1410,14 @@ class AppWindow:
                     lb.selection_set(i)
             self._fill_summary(
                 len(games), sum(1 for g in games if g.lower() in fg_map))
+            # 重建列表会把视图弹回顶部：拖「前台音量」或存备注后，
+            # 用户正看着第 15 行，一刷新就跳回第 1 行，很烦。恢复到原位。
+            try:
+                if top > 0.001:
+                    lb.yview_moveto(top)
+                self._on_list_scroll(*lb.yview())
+            except Exception:
+                pass
         except Exception:
             pass
         self._sync_pick()
@@ -1516,16 +1581,30 @@ class AppWindow:
                        self.pal["sub"], hold=2.0)
 
     def _add_game(self):
-        name = (self.var_newgame.get() or "").strip()
+        name = (self.var_newgame.get() or "").strip().strip('"')
         if not name:
             return
+        # 允许直接粘 exe 路径：路径转成进程名，省得用户自己截
+        if "\\" in name or "/" in name:
+            name = os.path.basename(name.replace("\\", "/"))
         games = list(self.config.get("mute_games", []) or [])
         if name.lower() in [g.lower() for g in games]:
+            self._set_foot("「%s」已经在名单里了" % name, self.pal["sub"], hold=2.5)
             return
         games.append(name)
         self._set("mute_games", sorted(games, key=str.lower))
         self.var_newgame.set("")
         self._fill_list()
+        # 名字写错（比如写成窗口标题）时这里能看出来：识别到说明的行中间有「·」
+        try:
+            text = self.m_list.get(self._rows.index(name))
+            ok = "  ·  " in text
+        except Exception:
+            ok = True
+        self._set_foot(
+            ("已加入「%s」" if ok else
+             "已加入「%s」；现在没检测到这个进程，启动后会自动识别") % name,
+            self.pal["sub"] if ok else self.pal["warn"], hold=3.0)
 
     def _del_game(self):
         lb = getattr(self, "m_list", None)

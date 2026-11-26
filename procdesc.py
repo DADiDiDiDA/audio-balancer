@@ -111,7 +111,14 @@ def _save_known():
         pass
 
 
-def _scan():
+def _scan(wanted=None):
+    """遍历进程表；只给 wanted 里的进程读版本资源。
+
+    读 exe 的文件属性要走一次 Windows 版本 API，机器上开着两百个进程时
+    逐个读能让「打开自动静音页」卡上一两百毫秒。名单通常只有二十来条，
+    所以只查需要的那些。
+    """
+    wanted = {str(n).lower() for n in (wanted or [])}
     out = {}
     for proc in psutil.process_iter(["name", "exe"]):
         try:
@@ -120,6 +127,8 @@ def _scan():
         except Exception:
             continue
         if not name or name in out:
+            continue
+        if wanted and name not in wanted:
             continue
         desc = ""
         if exe:
@@ -146,12 +155,16 @@ def describe(names, force=False, cache_dir=""):
     names = [str(n).strip().lower() for n in (names or []) if str(n).strip()]
     _load_known(cache_dir)
     now = time.time()
-    if force or now - _cache["at"] > TTL:
+    # 只扫「这一批名字」：名单增删后能立刻认出新加的程序，
+    # 又不会因为没在运行的程序反复重扫（它们也记进 scanned）。
+    fresh = set(names) <= _cache.get("scanned", set())
+    if force or not fresh or now - _cache["at"] > TTL:
         try:
-            _cache["map"] = _scan()
+            _cache["map"] = _scan(names)
         except Exception:
             _cache["map"] = {}
         _cache["at"] = now
+        _cache["scanned"] = set(names)
     out = {}
     for n in names:
         rec = _cache["map"].get(n)

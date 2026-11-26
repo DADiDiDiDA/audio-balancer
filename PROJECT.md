@@ -388,3 +388,23 @@ python -m PyInstaller 音频均衡器.spec --noconfirm --clean
 - `_list_metrics()` 结果按 Tk `scaling` 缓存到类属性，重绘不再每次都建两个探针 Listbox。
 - 空名单显示一行提示（不是空白的白框），`_rows` 保持为空，避免选中/删除拿到假名字。
 - 回归：`_audit_buttons.py` 39 项（新增空名单、没选中拖滑块不写盘、删除清配置、百分比成列）。
+
+### v1.8.7 补记：名单滚动 / 识别开销
+
+- **改单程序音量后列表跳回顶部**：`_fill_list()` 是「全删全插」，Tk 的 Listbox 在 `delete(0,'end')`
+  之后视图一定回到第一行。用户正看着第 15 行、拖完滑块一刷新就跳回顶部，很难继续操作。
+  现在先记 `lb.yview()[0]`，插完再 `yview_moveto()` 还原；选中项仍按名字保留。
+- **名单没有滚动条看不出还有内容**：`p.listbox()` 是裸 Listbox，20 个程序只露 10 行，没有任何
+  「下面还有」的提示。加了 4px 的自绘轨道 + 滑块（`_list_rail()` / `_on_list_scroll()`，
+  接 `yscrollcommand`），放得下时自动隐藏；不引原生 `tk.Scrollbar`，免得破坏卡片圆角。
+- **识别说明只在需要时查**：`procdesc._scan(wanted)` 以前对本机所有进程读 exe 版本资源
+  （每个进程一次 `GetFileVersionInfo`，两百个进程能卡一两百毫秒，还是在 UI 线程）。
+  现在只查名单里的名字；`_cache["scanned"]` 记住这一轮扫过谁，没在运行的程序不会被反复重扫。
+- **`describe()` 抛异常不再把名单清空**：以前整段 `try` 一起兜底，识别失败 = 列表空白；
+  现在单独兜底，识别不出就只显示进程名。
+- **关掉再打开自动静音会「啪」一下**：`tick()` 在 `mute_enabled=False` 时提前返回且不更新
+  `_last_tick`，重新开启时 `dt` 是关掉的整段时间、被夹到 1 秒上限 → 一帧到位。现在关闭期间
+  也续上时间戳，恢复时按设定的渐变时长走。
+- 添加程序允许直接粘 exe 路径（自动取文件名）；识别不到的会提示「启动后会自动识别」，
+  输入框右侧加了「例：MuMuPlayer.exe」。
+- 回归：`_audit_buttons.py` 39 项、`verify_persist.py` 44 项、`_ui_audit.py` 两档尺寸 0 越界。
