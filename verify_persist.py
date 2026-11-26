@@ -281,6 +281,80 @@ check("切前台后有声音", s.SimpleAudioVolume.v > 0.9, s.SimpleAudioVolume.
 
 M.foreground_info = lambda: ("other.exe", 424242)
 
+print("== 16) 单程序前台音量 ==")
+m, cfg = make_muter(["game.exe"])
+cfg["mute_fg_map"] = {"game.exe": 0.5}
+M.foreground_info = lambda: ("game.exe", live_pid)
+s = FakeSession("game.exe", live_pid, 1.0)
+pump(m, s, base=0, n=30)
+check("前台按单程序音量 50% 生效", abs(s.SimpleAudioVolume.v - 0.5) < 0.03,
+      s.SimpleAudioVolume.v)
+cfg["mute_fg_map"] = {}
+cfg["mute_fg_volume"] = 0.8
+pump(m, s, base=100, n=30)
+check("删掉单程序音量后回到默认值 80%", abs(s.SimpleAudioVolume.v - 0.8) < 0.03,
+      s.SimpleAudioVolume.v)
+cfg["mute_fg_map"] = {"game.exe": 0}
+pump(m, s, base=200, n=30)
+check("单程序音量 0% 时前台也不出声", s.SimpleAudioVolume.v < 0.02,
+      s.SimpleAudioVolume.v)
+
+print("== 17) 丢弃手动音量：前台强制固定值 ==")
+m, cfg = make_muter(["game.exe"])
+cfg["mute_fg_map"] = {"game.exe": 1.0}
+cfg["mute_force_fg"] = False
+M.foreground_info = lambda: ("game.exe", live_pid)
+s = FakeSession("game.exe", live_pid, 0.30)
+pump(m, s, base=0, n=30)
+check("关着时保留你自己调到 30%", abs(s.SimpleAudioVolume.v - 0.30) < 0.02,
+      s.SimpleAudioVolume.v)
+
+m, cfg = make_muter(["game.exe"])
+cfg["mute_fg_map"] = {"game.exe": 1.0}
+cfg["mute_force_fg"] = True
+s = FakeSession("game.exe", live_pid, 0.30)
+pump(m, s, base=0, n=30)
+check("打开后前台被强制成 100%", s.SimpleAudioVolume.v > 0.97,
+      s.SimpleAudioVolume.v)
+
+m, cfg = make_muter(["game.exe"])
+cfg["mute_fg_map"] = {"game.exe": 0.4}
+cfg["mute_force_fg"] = True
+s = FakeSession("game.exe", live_pid, 0.90)
+pump(m, s, base=0, n=30)
+check("打开后前台被强制成 40%（不是乘 0.9）", abs(s.SimpleAudioVolume.v - 0.4) < 0.03,
+      s.SimpleAudioVolume.v)
+pump(m, s, base=100, n=1)
+M.foreground_info = lambda: ("other.exe", 424242)
+pump(m, s, base=200, n=8)
+check("强制模式下切后台仍然静音", s.SimpleAudioVolume.v < 0.02, s.SimpleAudioVolume.v)
+
+print("== 18) 只剩「名单程序后台静音」一条规则 ==")
+m, cfg = make_muter(["game.exe"])
+cfg["mute_others_in_game"] = True      # 旧配置里还留着这个键
+M.foreground_info = lambda: ("game.exe", live_pid)
+other = FakeSession("music.exe", live_pid + 1, 1.0)
+game = FakeSession("game.exe", live_pid, 1.0)
+for i in range(10):
+    m._last_enum = i
+    m._sessions = [game, other]
+    m.tick(i * 0.3)
+check("名单程序在前台时，其它程序不再被压", abs(other.SimpleAudioVolume.v - 1.0) < 0.01,
+      other.SimpleAudioVolume.v)
+check("名单程序自己在前台保持正常", game.SimpleAudioVolume.v > 0.95,
+      game.SimpleAudioVolume.v)
+M.foreground_info = lambda: ("other.exe", 424242)
+for i in range(10):
+    m._last_enum = 100 + i
+    m._sessions = [game, other]
+    m.tick(100 + i * 0.3)
+check("名单程序在后台时仍然只静音它自己", game.SimpleAudioVolume.v < 0.02,
+      game.SimpleAudioVolume.v)
+check("别的程序依然不受影响", abs(other.SimpleAudioVolume.v - 1.0) < 0.01,
+      other.SimpleAudioVolume.v)
+
+M.foreground_info = lambda: ("other.exe", 424242)
+
 print()
 print(f"通过 {PASS} · 失败 {FAIL}")
 sys.exit(1 if FAIL else 0)

@@ -74,12 +74,20 @@ DEFAULTS = {
     "mute_enabled": True,
     # 列表里的程序在后台（最小化 / 挂机）时静音它自己 —— 默认开
     "mute_listed_in_background": True,
-    # 列表里的程序在前台时，把其它程序压到「其它程序音量」—— 默认关
-    "mute_others_in_game": False,
+    # 只有这一条规则：列表程序在后台才静音。以前还有「游戏时压制其它程序」，
+    # 会和「前台音量」互相打架，已删除（旧配置里的同名字段加载时自动丢弃）。
+    # 前台时「丢弃手动音量，强制用固定音量」——默认关：前台音量会乘在
+    # 用户自己调的音量上；打开后直接覆盖成固定值。
+    "mute_force_fg": False,
+    # 默认前台音量（没有单独设置的节目沿用这个）
     "mute_fg_volume": 1.0,
     "mute_bg_volume": 0.0,
     "mute_easing_ms": 500,
     "mute_ignore": [],
+    # 单程序前台音量：{进程名小写: 0..1}；没有条目 = 用默认值
+    "mute_fg_map": {},
+    # 单程序备注：{进程名小写: 说明}；只用于界面上「这行是什么程序」
+    "mute_note_map": {},
     "mute_games": [
         "YuanShen.exe", "BH3.exe", "StarRail.exe", "ZenlessZoneZero.exe",
         "Endfield.exe", "Langrisser.exe", "Mecharashi.exe", "TDJ.exe",
@@ -194,7 +202,9 @@ class Config:
                     for k in keys:
                         if k in data:
                             disk[k] = data[k]
-                    data = disk
+                    # 旧版本写过、这一版已经删掉的键（如 mute_others_in_game）
+                    # 不要再写回磁盘，否则它会一直躺在配置里被误以为还生效
+                    data = {k: v for k, v in disk.items() if k in DEFAULTS}
             except Exception:
                 pass
         tmp = None

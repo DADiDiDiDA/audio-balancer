@@ -350,3 +350,25 @@ python -m PyInstaller 音频均衡器.spec --noconfirm --clean
   （只在 raw ≈ 0 时补，避免把过时值当成当前意图）；前台分支在没有记录时也走 `_user_vol(raw)`，
   保证切到前台一定有声。
 - 记住：`restore()` 也用 `_user_vol()`，否则退出时会把 0 又写回去。
+
+### v1.8.5 补记：静音规则收敛 + 单程序前台音量
+
+- 规则只剩「名单程序在后台时静音自己」。`mute_others_in_game` 已从 `DEFAULTS` 删除
+  （旧配置里的同名字段加载时被丢弃），`tick()` 里不再有「游戏在前台就把其它程序压低」的分支。
+- 新增 `mute_force_fg`（默认 False）：True → 前台 `target = 该程序前台音量`（丢弃用户手动音量）；
+  False → `target = 用户原音量 × 该程序前台音量`。注意 **0 是合法值**（前台也静音），
+  不要拿 `or` 取默认值，否则 0 会被当成「没设」。
+- 新增 `mute_fg_map` / `mute_note_map`（都是 `{进程名小写: 值}`）。`fg_for()` 取单程序音量，
+  非数字 / 越界回落 `mute_fg_volume`；`mute_note_map` 只影响显示。
+- 界面：规则卡三行（启用 / 挂机静音 / 丢弃手动音量）、音量卡三字段、名单每行
+  「进程名 · 是什么程序 · 前台音量%」；选中一行后可单独设音量 / 写备注 / 用默认值。
+- **`_rows` 存原始进程名**：列表框里显示的是带说明的整行，删除必须按 `_rows[i]` 取，
+  否则 `picked` 里是整行文本，`mute_games` 一条都匹配不上（删不掉）。
+- 列表高度按 Tk 实际行高算：`_list_metrics()` 用 `height=1/2` 的 `winfo_reqheight()`
+  探出 `(row_px, base_px)`，`list_h = base_px + rows*row_px`；直接按剩余空间给像素高度
+  会把最后一行切成半个。
+- 新增 `procdesc.py`：进程名 → `FileDescription`（退回 `ProductName` → exe 所在目录名），
+  20 秒缓存；`FileDescription` 通常才是「MuMu模拟器」这种友好名，`ProductName` 常是
+  「Microsoft® Windows® Operating System」这类通用串。**备注优先于自动识别**。
+- 回归：`verify_persist.py` 44 项（单程序音量 3 / 强制模式 4 / 只剩一条规则 4）；
+  `_audit_buttons.py` 33 项（备注、用默认值、强制开关、删除按原始名、行内百分比）。

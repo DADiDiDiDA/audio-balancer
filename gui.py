@@ -16,12 +16,13 @@ from PIL import Image, ImageFilter, ImageGrab, ImageTk
 
 import autostart
 import ipc
+import procdesc
 import theme
 import ui_kit
 from theme import FONT
 
 APP_TITLE = "音频均衡器"
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 
 SIDE_W = 192
 
@@ -632,71 +633,114 @@ class AppWindow:
         pal = self.pal
         cfg = self.config
         p.text(x, y + 6, "自动静音", 18, bold=True)
-        p.text(x, y + 34, "按名单判断：谁在挂机、谁该让路", 10, pal["sub"])
+        p.text(x, y + 34, "名单里的程序切到后台就静音，回到前台按设定音量恢复", 10, pal["sub"])
 
         cy = y + 62
-        p.card(x, cy, w, 62)
-        p.text(x + 22, cy + 22, "启用自动静音", 11, bold=True)
-        p.help(x + 22 + ui_kit.text_width("启用自动静音", 11, True) + 12, cy + 22,
-               "总开关。关掉后立刻恢复所有程序的原音量，不再自动静音。")
-        p.text(x + 22, cy + 43, "关掉后立刻恢复所有程序的原音量", 9, pal["sub"])
-        p.toggle(x + w - 24 - 46, cy + 18, lambda: bool(cfg.get("mute_enabled", True)),
-                 self._on_mute)
+        gap = 16
+        cw = (w - gap) / 2.0
+        ch = 180
 
-        ry = cy + 74
-        p.card(x, ry, w, 146)
-        p.section(x + 22, ry + 24, "规则", "两条规则各自独立，只认名单里的程序", right=x + w - 22)
-        p.text(x + 22, ry + 54, "挂机静音", 10)
-        p.help(x + 22 + ui_kit.text_width("挂机静音", 10) + 12, ry + 54,
-               "名单里的程序切到后台（最小化/挂机）就只把它自己静音，其它程序不受影响。")
-        p.text(x + 22, ry + 74, "名单里的程序切到后台（最小化 / 挂机）就把它自己静音", 9, pal["sub"])
-        p.toggle(x + w - 24 - 46, ry + 48,
-                 lambda: bool(cfg.get("mute_listed_in_background", True)), self._on_mute_bg)
-        p.divider(x + 22, ry + 94, w - 44)
-        p.text(x + 22, ry + 112, "游戏时压制其它程序", 10)
-        p.help(x + 22 + ui_kit.text_width("游戏时压制其它程序", 10) + 12, ry + 112,
-               "名单里的程序在前台时，把其它程序的音量压到下面「压到」的值，"
-               "用来突出游戏/会议的声音。")
-        p.text(x + 22, ry + 132, "名单里的程序在前台时，把其它程序压到「压到」的值", 9, pal["sub"])
-        p.toggle(x + w - 24 - 46, ry + 106,
-                 lambda: bool(cfg.get("mute_others_in_game", False)), self._on_mute_others)
+        # ---- 左：规则（只有「后台静音」这一条，外加两个开关）----
+        p.card(x, cy, cw, ch)
+        p.section(x + 20, cy + 24, "规则", "只认名单里的程序", right=x + cw - 20)
 
-        vy = ry + 158
-        p.card(x, vy, w, 160)
-        p.section(x + 22, vy + 24, "音量")
-        col = (w - 44 - 26) / 2.0
-        p.field(x + 22, vy + 52, col, "名单程序在前台时",
-                float(cfg.get("mute_fg_volume", 1.0)), 0, 1, 0.05,
-                self._on_fg, fmt=lambda v: "%.0f%%" % (v * 100),
-                tip="名单里的程序自己在前台时的音量，一般保持 100%。")
-        p.field(x + 22 + col + 26, vy + 52, col, "压到",
-                float(cfg.get("mute_bg_volume", 0.0)), 0, 1, 0.05,
-                self._on_bg, fmt=lambda v: "%.0f%%" % (v * 100),
-                tip="别的程序被压到多少音量。0% 就是完全静音，想还能听见点就用 10~20%。")
-        p.field(x + 22, vy + 110, col, "渐变时长",
+        def row(ry, title, note, get, cb, tip):
+            p.text(x + 20, ry, title, 10)
+            p.help(x + 20 + ui_kit.text_width(title, 10) + 10, ry, tip)
+            p.toggle(x + cw - 20 - 46, ry - 7, get, cb)
+            p.text(x + 20, ry + 19, note, 9, pal["sub"])
+
+        row(cy + 52, "启用自动静音", "关掉后立刻恢复所有程序的原音量",
+            lambda: bool(cfg.get("mute_enabled", True)), self._on_mute, "总开关")
+        row(cy + 98, "挂机静音", "名单程序在后台时只静音它自己",
+            lambda: bool(cfg.get("mute_listed_in_background", True)),
+            self._on_mute_bg, "唯一规则，不影响其它程序")
+        row(cy + 144, "丢弃手动音量", "前台时强制用设定音量",
+            lambda: bool(cfg.get("mute_force_fg", False)), self._on_force_fg,
+            "忽略你在系统音量里手调的值，直接写成固定音量")
+
+        # ---- 右：音量 ----
+        bx = x + cw + gap
+        p.card(bx, cy, cw, ch)
+        p.section(bx + 20, cy + 24, "音量", "默认值 / 后台 / 过渡", right=bx + cw - 20)
+        col = cw - 40
+        p.field(bx + 20, cy + 46, col, "默认前台音量",
+                float(cfg.get("mute_fg_volume", 1.0)), 0, 1, 0.05, self._on_fg,
+                fmt=lambda v: "%.0f%%" % (v * 100),
+                tip="没有单独设过的程序在前台时用这个音量，一般 100%。")
+        p.field(bx + 20, cy + 92, col, "后台压到",
+                float(cfg.get("mute_bg_volume", 0.0)), 0, 1, 0.05, self._on_bg,
+                fmt=lambda v: "%.0f%%" % (v * 100),
+                tip="名单程序在后台时压到多少音量。0% 完全静音。")
+        p.field(bx + 20, cy + 138, col, "渐变时长",
                 float(cfg.get("mute_easing_ms", 300)), 100, 2000, 50,
                 self._on_easing, fmt=lambda v: "%.0f ms" % v,
-                tip="音量变化的过渡时间。太短会有突兀的「啪」，太长会显得反应迟钝。")
+                tip="音量变化的过渡时间，太短会「啪」一下。")
 
-        gy = vy + 174
-        head, row_h, line_px = 52, 44, 23     # 23px = YaHei 10pt 的实测行高
-        list_h = int(H - gy - 8 - head - row_h - 6)
-        list_h = max(line_px * 3, (list_h // line_px) * line_px)   # 整行数，避免半行被切
-        # +6：输入框高 32，行高 44 时底部只剩 4px，给卡片底留点呼吸
-        gh = head + list_h + row_h + 6
+        # ---- 名单 ----
+        gy = cy + ch + 12
+        head, foot_h = 52, 130
+        row_px, base_px = self._list_metrics()
+        avail = int(H - gy - 8 - head - foot_h)
+        rows = max(3, (avail - base_px) // max(1, row_px))
+        list_h = base_px + rows * row_px          # 正好整行，不留半行
+        gh = head + list_h + foot_h
         p.card(x, gy, w, gh)
-        p.section(x + 22, gy + 26, "名单", "填进程名，如 StarRail.exe（不区分大小写）",
+        p.section(x + 22, gy + 26, "名单", "进程名 · 是什么程序 · 前台音量",
                   right=x + w - 22,
-                  tip="只认这里的程序。进程名看任务管理器「详细信息」里的名称，不区分大小写。")
+                  tip="只认这里的程序（不区分大小写）。选中一行，下面能单独改它在前台时的音量，"
+                      "也能写一句备注，方便记住这串进程名到底是谁。")
         lb = p.listbox(x + 24, gy + head, w - 48, list_h)
-        for g in sorted((cfg.get("mute_games", []) or []), key=str.lower):
-            lb.insert("end", g)
         self.m_list = lb
-        row_y = gy + head + list_h + 8
-        p.entry(x + 22, row_y, 202, 32, self.var_newgame, self._add_game)
-        p.button(x + 22 + 210, row_y, 62, 32, "添加", self._add_game)
-        p.button(x + 22 + 280, row_y, 88, 32, "删除选中", self._del_game, kind="ghost")
-        p.button(x + 22 + 376, row_y, 92, 32, "恢复默认", self._reset_games, kind="ghost")
+        lb.bind("<<ListboxSelect>>", lambda e: self._sync_pick())
+        self.m_note_var = tk.StringVar(master=self.root, value="")
+        # 编辑控件还没画出来：先清空引用，免得 _fill_list 摸到上一轮已删除的图元
+        self.m_pick_lbl = None
+        self.m_pick_fg = None
+        self._fill_list()
+
+        # ---- 选中项的单独设置 ----
+        ey = gy + head + list_h + 8
+        p.divider(x + 22, ey - 6, w - 44)
+        self.m_pick_lbl = p.text(x + 22, ey + 10, "未选中", 10, pal["sub"])
+        p.button(x + w - 22 - 84, ey + 2, 84, 26, "用默认值",
+                 self._reset_pick_fg, kind="ghost")
+        self.m_pick_fg = p.field(x + 22, ey + 34, 236, "前台音量",
+                                 self._fg_of(self._pick_game()), 0, 1, 0.05,
+                                 self._on_pick_fg,
+                                 fmt=lambda v: "%.0f%%" % (v * 100),
+                                 tip="只对这个程序生效，默认跟随上面的「默认前台音量」")
+        p.text(x + 286, ey + 56, "备注", 10, pal["sub"])
+        p.entry(x + 322, ey + 44, 220, 30, self.m_note_var, self._save_note)
+        p.button(x + 550, ey + 44, 78, 30, "保存备注", self._save_note,
+                 kind="soft")
+
+        ry = ey + 88
+        p.entry(x + 22, ry, 202, 32, self.var_newgame, self._add_game)
+        p.button(x + 232, ry, 62, 32, "添加", self._add_game)
+        p.button(x + 302, ry, 88, 32, "删除选中", self._del_game, kind="ghost")
+        p.button(x + 398, ry, 100, 32, "恢复默认名单", self._reset_games,
+                 kind="ghost")
+        self._sync_pick()
+
+    def _list_metrics(self):
+        """Listbox 每一行的实际像素高度，以及固定的边框补偿。
+
+        Tk 的 Listbox 只保证「整数行」，不会自己避开半行；直接按剩余空间
+        给像素高度，最后一行会被切掉一半。这里先探一次真实行高，
+        再按整行数算高度。
+        """
+        try:
+            one = tk.Listbox(self.root, font=(FONT, 10), height=1)
+            h1 = one.winfo_reqheight()
+            one.destroy()
+            two = tk.Listbox(self.root, font=(FONT, 10), height=2)
+            h2 = two.winfo_reqheight()
+            two.destroy()
+            row = max(10, h2 - h1)
+            return row, max(0, h1 - row)
+        except Exception:
+            return 24, 4
 
     def _page_device(self, p, x, y, w, H):
         pal = self.pal
@@ -1180,8 +1224,11 @@ class AppWindow:
     def _on_mute_bg(self, v):
         self._set("mute_listed_in_background", bool(v))
 
-    def _on_mute_others(self, v):
-        self._set("mute_others_in_game", bool(v))
+    def _on_force_fg(self, v):
+        self._set("mute_force_fg", bool(v))
+        self._set_foot("前台时忽略你手动调的音量" if v else
+                       "前台音量会乘在你手动调的音量上",
+                       self.pal["sub"], hold=3.0)
 
     def _on_fg(self, v):
         self._set("mute_fg_volume", float(v))
@@ -1250,16 +1297,135 @@ class AppWindow:
         lb = getattr(self, "m_list", None)
         if lb is None:
             return
+        rows = getattr(self, "_rows", [])
         try:
-            keep = {lb.get(i) for i in lb.curselection()}
+            keep = {rows[i] for i in lb.curselection() if i < len(rows)}
+        except Exception:
+            keep = set()
+        try:
             lb.delete(0, "end")
-            items = sorted(self.config.get("mute_games", []) or [], key=str.lower)
-            for i, g in enumerate(items):
-                lb.insert("end", g)
+            games = sorted(self.config.get("mute_games", []) or [], key=str.lower)
+            info = procdesc.describe(games)
+            notes = self.config.get("mute_note_map") or {}
+            fg_map = self.config.get("mute_fg_map") or {}
+            default = float(self.config.get("mute_fg_volume", 1.0) or 1.0)
+            self._rows = list(games)
+            for i, g in enumerate(games):
+                low = g.lower()
+                desc = str(notes.get(low, "") or "").strip()
+                if not desc:
+                    desc = (info.get(low) or {}).get("text", "")
+                desc = desc[:26]
+                v = fg_map.get(low)
+                try:
+                    pct = int(round((float(v) if v is not None else default) * 100))
+                except (TypeError, ValueError):
+                    pct = 100
+                tail = ("  ·  " + desc) if desc else ""
+                lb.insert("end", "%s%s  ·  %d%%" % (g, tail, pct))
                 if g in keep:
                     lb.selection_set(i)
         except Exception:
             pass
+        self._sync_pick()
+
+    def _pick_game(self):
+        """当前选中的进程名；没选中返回空串。"""
+        lb = getattr(self, "m_list", None)
+        rows = getattr(self, "_rows", [])
+        if lb is None:
+            return ""
+        try:
+            sel = lb.curselection()
+        except Exception:
+            return ""
+        if not sel:
+            return ""
+        return rows[sel[0]] if sel[0] < len(rows) else ""
+
+    def _fg_of(self, name):
+        fg_map = self.config.get("mute_fg_map") or {}
+        v = fg_map.get((name or "").lower())
+        if v is None:
+            try:
+                return float(self.config.get("mute_fg_volume", 1.0))
+            except (TypeError, ValueError):
+                return 1.0
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _sync_pick(self):
+        """把选中项的音量 / 备注同步到下面的编辑控件。"""
+        name = self._pick_game()
+        try:
+            if self.m_pick_lbl is not None:
+                self._painter.cv.itemconfigure(
+                    self.m_pick_lbl,
+                    text=("选中：%s" % name) if name else
+                    "未选中（先在上面点一行）")
+        except Exception:
+            pass
+        v = self._fg_of(name)
+        try:
+            if self.m_pick_fg is not None:
+                self.m_pick_fg.set_value(v, notify=False)
+                if getattr(self.m_pick_fg, "show", None):
+                    self.m_pick_fg.show(v)
+        except Exception:
+            pass
+        try:
+            notes = self.config.get("mute_note_map") or {}
+            self.m_note_var.set(str(notes.get(name.lower(), "") or ""))
+        except Exception:
+            pass
+
+    def _on_pick_fg(self, v):
+        name = self._pick_game()
+        if not name:
+            self._set_foot("先在名单里选一个程序", self.pal["warn"], hold=2.5)
+            return
+        fg_map = dict(self.config.get("mute_fg_map") or {})
+        fg_map[name.lower()] = round(float(v), 3)
+        self._set("mute_fg_map", fg_map)
+        # 拖滑块时别每格都重建列表框（会打断拖动），停手再刷
+        job = getattr(self, "_pick_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._pick_job = self.root.after(200, self._after_pick_fg)
+
+    def _after_pick_fg(self):
+        self._pick_job = None
+        self._fill_list()
+
+    def _reset_pick_fg(self):
+        name = self._pick_game()
+        if not name:
+            return
+        fg_map = dict(self.config.get("mute_fg_map") or {})
+        if fg_map.pop(name.lower(), None) is not None:
+            self._set("mute_fg_map", fg_map)
+        self._fill_list()
+        self._set_foot("「%s」改回默认前台音量" % name, self.pal["sub"], hold=2.5)
+
+    def _save_note(self):
+        name = self._pick_game()
+        if not name:
+            return
+        text = (self.m_note_var.get() or "").strip()[:40]
+        notes = dict(self.config.get("mute_note_map") or {})
+        if text:
+            notes[name.lower()] = text
+        else:
+            notes.pop(name.lower(), None)
+        self._set("mute_note_map", notes)
+        self._fill_list()
+        self._set_foot("备注已保存" if text else "备注已清除",
+                       self.pal["sub"], hold=2.0)
 
     def _add_game(self):
         name = (self.var_newgame.get() or "").strip()
@@ -1280,7 +1446,11 @@ class AppWindow:
         sel = list(lb.curselection())
         if not sel:
             return
-        picked = {lb.get(i) for i in sel}
+        # 列表里显示的是「名称 · 说明 · 100%」，删的时候要用原始进程名
+        rows = getattr(self, "_rows", [])
+        picked = {rows[i] for i in sel if i < len(rows)}
+        if not picked:
+            return
         games = [g for g in (self.config.get("mute_games", []) or [])
                  if g not in picked]
         self._set("mute_games", sorted(games, key=str.lower))

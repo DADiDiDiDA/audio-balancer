@@ -262,10 +262,25 @@ class Muter:
         self.foreground, self._fg_pid = foreground_info()
         self.in_game = bool(games) and self.foreground in games
         mute_bg_listed = bool(cfg.get("mute_listed_in_background", True))
-        # 与 config.DEFAULTS 保持一致（这里以前写 True，缺键时行为和界面对不上）
-        mute_others = bool(cfg.get("mute_others_in_game", False))
+        # 前台是否丢掉用户手动音量、直接写成固定值
+        force_fg = bool(cfg.get("mute_force_fg", False))
+        fg_default = _num(cfg, "mute_fg_volume", 1.0, 0.0, 1.0)
+        fg_map = cfg.get("mute_fg_map")
+        fg_map = fg_map if isinstance(fg_map, dict) else {}
 
-        fg_vol = _num(cfg, "mute_fg_volume", 1.0, 0.0, 1.0)
+        def fg_for(nm):
+            """这个程序在前台时的音量系数（没单独设过就用默认值）。"""
+            v = fg_map.get(nm)
+            if v is None:
+                return fg_default
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return fg_default
+            if not math.isfinite(v):
+                return fg_default
+            return max(0.0, min(1.0, v))
+
         bg_vol = _num(cfg, "mute_bg_volume", 0.0, 0.0, 1.0)
         # 渐变系数按「真实经过时间」算，而不是固定按 0.3 秒一次估：
         # 以前 easing=300ms 实际要约 0.9 秒才到位，设 2000ms 和 1000ms 听感差不多。
@@ -314,16 +329,19 @@ class Muter:
                 self._orig[key] = (self._saved[name],
                                    int(getattr(s, "ProcessId", 0) or 0), name)
             if listed and is_foreground:
-                # 在前台：回到「用户自己设的音量」，再乘上这里配的比例。
+                # 在前台：回到「用户自己设的音量」，再乘上这个程序配的比例。
                 # 以前直接用 fg_vol（默认 100%），会把用户手动调到 30% 的游戏
                 # 硬拉回 100% —— 听起来就是「程序自己在改我的音量」。
-                base = (_user_vol(self._orig[key][0]) if key in self._orig
-                        else _user_vol(raw))
-                target = base * fg_vol
+                # 打开「丢弃手动音量」后就不乘了，直接写死成这个固定值。
+                vol = fg_for(name)
+                if force_fg:
+                    target = vol
+                else:
+                    base = (_user_vol(self._orig[key][0]) if key in self._orig
+                            else _user_vol(raw))
+                    target = base * vol
             elif listed and mute_bg_listed and not fg_uncertain:
                 target = bg_vol          # 在后台（最小化/挂机）：静音它自己
-            elif self.in_game and mute_others:
-                target = bg_vol          # 游戏在前台：其它程序让路
             else:
                 # 不在处理范围：如果我们之前动过，还原一次，然后完全放手。
                 # 以前会把 target 设成"记录的原始音量"，于是用户手动把音量调小
